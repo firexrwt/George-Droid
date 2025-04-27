@@ -64,7 +64,7 @@ TWITCH_REFRESH_TOKEN = os.getenv('TWITCH_REFRESH_TOKEN')
 
 # --- Настройки Ollama ---
 OLLAMA_API_URL = os.getenv('OLLAMA_API_URL', "http://localhost:11434/api/chat")
-OLLAMA_MODEL_NAME = os.getenv('OLLAMA_MODEL_NAME', "llama3.1:8b-instruct-q5_K_S")
+OLLAMA_MODEL_NAME = os.getenv('OLLAMA_MODEL_NAME', "llama3:8b-instruct-q5_K_S")
 
 # --- Настройки Piper TTS ---
 PIPER_EXE_PATH = os.getenv('PIPER_EXE_PATH', 'piper_tts_bin/piper.exe')
