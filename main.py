@@ -1,3 +1,4 @@
+# main.py
 import os
 import sys
 import keyboard
@@ -16,10 +17,15 @@ import wave
 import scipy.signal
 import queue
 import threading
-import chess
-import chess.engine
 import random
 import re
+
+# --- Основные импорты для Vertex AI ---
+import google.auth
+import google.auth.exceptions
+import vertexai  # Импортируем основной модуль
+# Импортируем классы для нового GenerativeModel API
+from vertexai.preview.generative_models import GenerativeModel, Part, Content, GenerationConfig
 
 # --- Загрузка DLL ---
 try:
@@ -62,9 +68,11 @@ TWITCH_CLIENT_ID = os.getenv('TWITCH_CLIENT_ID')
 TWITCH_CLIENT_SECRET = os.getenv('TWITCH_CLIENT_SECRET')
 TWITCH_REFRESH_TOKEN = os.getenv('TWITCH_REFRESH_TOKEN')
 
-# --- Настройки Ollama ---
-OLLAMA_API_URL = os.getenv('OLLAMA_API_URL', "http://localhost:11434/api/chat")
-OLLAMA_MODEL_NAME = os.getenv('OLLAMA_MODEL_NAME', "llama3:8b-instruct-q5_K_S")
+# --- Настройки Vertex AI ---
+VERTEXAI_PROJECT_ID = os.getenv('VERTEXAI_PROJECT_ID')
+VERTEXAI_LOCATION = os.getenv('VERTEXAI_LOCATION')
+VERTEXAI_MODEL_NAME = os.getenv('VERTEXAI_MODEL_NAME')  # Должен быть БЕЗ meta/ префикса!
+VERTEXAI_SERVICE_ACCOUNT_PATH = os.getenv('VERTEXAI_SERVICE_ACCOUNT_PATH')  # Путь к ключу
 
 # --- Настройки Piper TTS ---
 PIPER_EXE_PATH = os.getenv('PIPER_EXE_PATH', 'piper_tts_bin/piper.exe')
@@ -104,53 +112,8 @@ stt_enabled = True
 chat_interaction_enabled = True
 is_processing_response = False
 tts_lock = asyncio.Lock()
-
-# --- Шахматные переменные ---
-chess_board = None
-chess_engine = None
-is_chess_game_active = False
-player_color = None
-bot_color = None
-STOCKFISH_PATH = os.getenv('STOCKFISH_PATH', r"C:\stockfish\stockfish-windows-x86-64-avx2.exe")
-GUI_SCRIPT_PATH = "pysimplegui_chess_gui.py"  # Имя GUI скрипта
-gui_process = None
-chess_game_task = None
-ipc_player_move_queue = asyncio.Queue()
-
-# --- Загрузка модели Faster Whisper ---
-stt_model = None
-try:
-    from faster_whisper import WhisperModel
-
-    print(f"Загрузка faster-whisper '{STT_MODEL_SIZE}'...")
-    stt_model = WhisperModel(STT_MODEL_SIZE, device=STT_DEVICE, compute_type=STT_COMPUTE_TYPE)
-    print("Модель faster-whisper загружена.")
-except ImportError:
-    print("ОШИБКА: faster-whisper не установлен.")
-    stt_model = None
-except Exception as e:
-    print(f"Критическая ошибка загрузки faster-whisper: {e}")
-    stt_model = None
-
-# --- Чтение Sample Rate из конфига голоса Piper ---
-piper_sample_rate = None
-try:
-    if os.path.exists(VOICE_CONFIG_PATH):
-        with open(VOICE_CONFIG_PATH, 'r', encoding='utf-8') as f:
-            piper_sample_rate = json.load(f).get('audio', {}).get('sample_rate')
-        if piper_sample_rate:
-            print(f"Piper SR: {piper_sample_rate}")
-        else:
-            print(f"ОШИБКА: Не найден 'sample_rate' в {VOICE_CONFIG_PATH}")
-    else:
-        print(f"ОШИБКА: Не найден JSON конфиг голоса: {os.path.abspath(VOICE_CONFIG_PATH)}")
-
-    if not all([os.path.exists(PIPER_EXE_PATH), os.path.exists(VOICE_MODEL_PATH), piper_sample_rate]):
-        print("ОШИБКА: TTS (Piper) не будет работать.")
-        piper_sample_rate = None
-except Exception as e:
-    print(f"Критическая ошибка инициализации Piper TTS: {e}")
-    piper_sample_rate = None
+vertexai_initialized_successfully = False  # Флаг успешной инициализации
+vertexai_model_instance = None  # Глобальный экземпляр модели
 
 # --- Системный промпт ---
 SYSTEM_PROMPT = """## Твоя Личность: Джордж Дроид
@@ -199,9 +162,85 @@ if len(prompt_lines) > 1 and prompt_lines[0].startswith("## Твоя Лично�
 print(f"Имя бота для триггеров: '{BOT_NAME_FOR_CHECK}'")
 
 
+# --- ИНИЦИАЛИЗАЦИЯ VERTEX AI (Один раз при старте) ---
+def initialize_vertexai():
+    global vertexai_initialized_successfully, vertexai_model_instance, VERTEXAI_PROJECT_ID
+
+    if not VERTEXAI_PROJECT_ID:
+        print("ОШИБКА: VERTEXAI_PROJECT_ID не указан в .env")
+        return
+    if not VERTEXAI_LOCATION:
+        print("ОШИБКА: VERTEXAI_LOCATION не указан в .env")
+        return
+    if not VERTEXAI_MODEL_NAME:
+        print("ОШИБКА: VERTEXAI_MODEL_NAME не указан в .env (нужен без meta/ префикса!)")
+        return
+
+    print(f"Инициализация Vertex AI (Проект: {VERTEXAI_PROJECT_ID}, Регион: {VERTEXAI_LOCATION})...")
+    credentials = None
+    auth_method = ""
+    project_id_to_use = VERTEXAI_PROJECT_ID  # Начинаем с проекта из .env
+
+    # 1. Пытаемся использовать ключ сервис-аккаунта, если путь указан
+    if VERTEXAI_SERVICE_ACCOUNT_PATH:
+        if os.path.exists(VERTEXAI_SERVICE_ACCOUNT_PATH):
+            try:
+                credentials, detected_project = google.auth.load_credentials_from_file(VERTEXAI_SERVICE_ACCOUNT_PATH)
+                auth_method = f"Ключ сервис-аккаунта: {VERTEXAI_SERVICE_ACCOUNT_PATH}"
+                print(f"Vertex AI: Используется {auth_method}")
+            except Exception as e_key:
+                print(f"Ошибка загрузки ключа сервис-аккаунта ({VERTEXAI_SERVICE_ACCOUNT_PATH}): {e_key}")
+                print("Попытка использовать Application Default Credentials (ADC)...")
+                credentials = None  # Сбрасываем, чтобы перейти к ADC
+        else:
+            print(
+                f"Предупреждение: Указан путь к ключу сервис-аккаунта ({VERTEXAI_SERVICE_ACCOUNT_PATH}), но файл не найден.")
+            print("Попытка использовать Application Default Credentials (ADC)...")
+
+    # 2. Если ключ не использовался или не сработал, пробуем ADC
+    if not credentials:
+        try:
+            credentials, detected_project = google.auth.default()
+            project_id_to_use = VERTEXAI_PROJECT_ID or detected_project
+            if not project_id_to_use:
+                raise ValueError("Project ID не найден ни в .env, ни в ADC.")
+            auth_method = "Application Default Credentials (ADC)"
+            print(f"Vertex AI: Используются {auth_method}. Проект: {project_id_to_use}")
+
+        except google.auth.exceptions.DefaultCredentialsError:
+            print("\nОШИБКА: Не удалось аутентифицироваться через ADC.")
+            print("Выполните 'gcloud auth application-default login' ИЛИ проверьте ключ SA.\n")
+            return  # Выход, если аутентификация не удалась
+        except Exception as e_adc:
+            print(f"\nОШИБКА при аутентификации ADC: {e_adc}")
+            return  # Выход
+
+    # 3. Если аутентификация прошла и проект известен, инициализируем vertexai
+    try:
+        VERTEXAI_PROJECT_ID = project_id_to_use  # Устанавливаем актуальный ID проекта
+        vertexai.init(project=VERTEXAI_PROJECT_ID, location=VERTEXAI_LOCATION, credentials=credentials)
+        print(
+            f"Vertex AI SDK инициализирован (проект: {VERTEXAI_PROJECT_ID}, локация: {VERTEXAI_LOCATION}, метод: {auth_method}).")
+
+        # Создаем экземпляр модели один раз
+        print(f"Загрузка GenerativeModel: {VERTEXAI_MODEL_NAME}...")
+        # Передаем системный промпт при создании модели
+        vertexai_model_instance = GenerativeModel(
+            VERTEXAI_MODEL_NAME,
+            system_instruction=SYSTEM_PROMPT
+        )
+        print("Экземпляр GenerativeModel создан.")
+        vertexai_initialized_successfully = True
+
+    except Exception as e_init:
+        print(f"Критическая ошибка инициализации Vertex AI SDK или GenerativeModel: {e_init}")
+        vertexai_initialized_successfully = False
+
+
 # --- Вспомогательные функции ---
 
 def resample_audio(audio_data: np.ndarray, input_rate: int, target_rate: int) -> np.ndarray:
+    
     if input_rate == target_rate:
         return audio_data.astype(np.float32)
     try:
@@ -215,6 +254,7 @@ def resample_audio(audio_data: np.ndarray, input_rate: int, target_rate: int) ->
 
 
 def audio_recording_thread(device_index=None):
+    
     global audio_queue, recording_active, stt_enabled, is_processing_response
 
     def audio_callback(indata, frames, time, status):
@@ -249,6 +289,7 @@ def audio_recording_thread(device_index=None):
 
 
 def transcribe_audio_faster_whisper(audio_np_array):
+    
     global stt_model
     if stt_model is None or not isinstance(audio_np_array, np.ndarray) or audio_np_array.size == 0:
         return None
@@ -260,50 +301,109 @@ def transcribe_audio_faster_whisper(audio_np_array):
         return None
 
 
-async def get_ollama_response(user_message):
-    global conversation_history, OLLAMA_API_URL, OLLAMA_MODEL_NAME, SYSTEM_PROMPT
+# --- НОВАЯ ВЕРСИЯ: Функция запроса к Vertex AI через GenerativeModel ---
+async def get_vertexai_response(user_message):
+    global conversation_history, vertexai_model_instance, vertexai_initialized_successfully
+
+    if not vertexai_initialized_successfully or not vertexai_model_instance:
+        print("Vertex AI не инициализирован успешно. Запрос невозможен.", file=sys.stderr)
+        return None
+
     is_monologue_request = user_message.startswith("Сгенерируй короткое")
-    is_chess_commentary = "Шахматы:" in user_message or "ход:" in user_message.lower()
 
-    if is_monologue_request or is_chess_commentary:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
+    # --- Формирование истории для generate_content ---
+    # generate_content ожидает список Content объектов (а не словарей)
+    # Системный промпт уже передан при создании model_instance
+    vertex_history = []
+    current_msg_obj = None  # Для локальной истории
+
+    history_to_convert = []
+    if not is_monologue_request:
+        current_msg_obj = {"role": "user", "content": user_message}
+        # Берем последние N пар сообщений
+        history_to_convert = conversation_history[-(MAX_HISTORY_LENGTH * 2):] if MAX_HISTORY_LENGTH > 0 else []
+        history_to_convert.append(current_msg_obj)
     else:
-        current_msg = {"role": "user", "content": user_message}
-        temp_history = conversation_history + [current_msg]
-        if len(temp_history) > MAX_HISTORY_LENGTH:
-            temp_history = temp_history[-MAX_HISTORY_LENGTH:]
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + temp_history
+        # Для монолога - только сам запрос
+        history_to_convert = [{"role": "user", "content": user_message}]
 
-    payload = {"model": OLLAMA_MODEL_NAME, "messages": messages, "stream": False}
-    timeout = aiohttp.ClientTimeout(total=120 if is_chess_commentary else 60)
+    # Конвертируем историю в формат Content/Part
+    # Важно: модель ожидает чередование user -> model -> user -> model ...
+    # Роль 'system' не используется здесь, т.к. она задана в system_instruction
+    for msg in history_to_convert:
+        role = msg["role"]
+        # Роль 'assistant' должна быть 'model' для этого API
+        if role == "assistant":
+            role = "model"
+        # Пропускаем неизвестные роли (на всякий случай)
+        if role not in ["user", "model"]:
+            continue
+        try:
+            # Создаем Content объект с правильной ролью и текстом
+            vertex_history.append(Content(role=role, parts=[Part.from_text(msg["content"])]))
+        except Exception as e_content:
+            print(f"Ошибка создания Vertex AI Content для сообщения: {msg}. Ошибка: {e_content}", file=sys.stderr)
+            # Пропускаем это сообщение, чтобы не сломать запрос
+            continue
+
+    # --- Конфигурация генерации ---
+    generation_config = GenerationConfig(
+        temperature=0.7,
+        max_output_tokens=512,
+        top_p=0.95,
+        top_k=40
+    )
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OLLAMA_API_URL, json=payload, timeout=timeout) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    content = data.get('message', {}).get('content')
-                    if content:
-                        if not is_monologue_request and not is_chess_commentary:
-                            conversation_history.extend([current_msg, {"role": "assistant", "content": content}])
-                            if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
-                                conversation_history = conversation_history[-(MAX_HISTORY_LENGTH * 2):]
-                        return content.strip()
-                    else:
-                        print(f"Ollama пустой ответ: {data}", file=sys.stderr)
-                        return None
-                else:
-                    print(f"Ошибка Ollama: {response.status}, {await response.text()}", file=sys.stderr)
-                    return None
-    except asyncio.TimeoutError:
-        print(f"Ошибка Ollama: Таймаут ({timeout.total} сек).", file=sys.stderr)
-        return None
+        print(f"Vertex AI GenerativeModel Запрос к: {VERTEXAI_MODEL_NAME}")
+        # print(f"DEBUG: Отправляемая история: {vertex_history}") # Раскомментируй для отладки
+
+        # Асинхронный вызов generate_content
+        response = await asyncio.to_thread(
+            vertexai_model_instance.generate_content,
+            contents=vertex_history,
+            generation_config=generation_config
+        )
+        print("Vertex AI GenerativeModel Ответ получен.")
+
+        # --- Парсинг ответа ---
+        # Ожидаем, что ответ будет в response.text (или response.candidates[0].content.parts[0].text)
+        if response.candidates and response.candidates[0].content.parts:
+            content = response.candidates[0].content.parts[0].text
+        elif hasattr(response, 'text'):  # Простой .text может быть доступен для простых ответов
+            content = response.text
+        else:
+            content = None  # Не смогли извлечь ответ
+
+        if content:
+            # Обновляем локальную историю, если это не монолог и был запрос пользователя
+            if not is_monologue_request and current_msg_obj:
+                conversation_history.extend([current_msg_obj, {"role": "assistant", "content": content.strip()}])
+                if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
+                    conversation_history = conversation_history[-(MAX_HISTORY_LENGTH * 2):]
+            return content.strip()
+        else:
+            print(f"Vertex AI пустой или нераспознанный ответ: {response}", file=sys.stderr)
+            return None
+        # --- Конец парсинга ---
+
+    # Обработка специфичных ошибок Vertex AI (если нужно)
+    # except vertexai.generative_models._generative_models.BlockedPromptException as e_blocked:
+    #    print(f"Ошибка Vertex AI: Запрос заблокирован системой безопасности. Причина: {e_blocked}", file=sys.stderr)
+    #    return None
     except Exception as e:
-        print(f"Ошибка Ollama ({type(e).__name__}): {e}", file=sys.stderr)
+        print(f"Ошибка Vertex AI GenerativeModel ({type(e).__name__}): {e}", file=sys.stderr)
+        # Попробуем вывести детали ошибки, если они есть
+        if hasattr(e, 'message'): print(f"   Сообщение: {e.message}", file=sys.stderr)
+        if hasattr(e, 'details'): print(f"   Детали: {e.details()}", file=sys.stderr)
         return None
+
+
+# --- КОНЕЦ НОВОЙ ВЕРСИИ ---
 
 
 def play_raw_audio_sync(audio_bytes, samplerate, dtype='int16'):
+    
     if not audio_bytes or not samplerate:
         return
     try:
@@ -313,6 +413,7 @@ def play_raw_audio_sync(audio_bytes, samplerate, dtype='int16'):
 
 
 async def speak_text(text_to_speak):
+    
     global piper_sample_rate, PIPER_EXE_PATH, VOICE_MODEL_PATH, tts_lock
     if not piper_sample_rate or not os.path.exists(PIPER_EXE_PATH) or not os.path.exists(VOICE_MODEL_PATH):
         print("TTS недоступен.")
@@ -362,6 +463,7 @@ async def speak_text(text_to_speak):
 
 
 def toggle_stt():
+    
     global stt_enabled, audio_queue
     stt_enabled = not stt_enabled
     status = "ВКЛ" if stt_enabled else "ВЫКЛ"
@@ -372,412 +474,11 @@ def toggle_stt():
 
 
 def toggle_chat_interaction():
+    
     global chat_interaction_enabled
     chat_interaction_enabled = not chat_interaction_enabled
     status = "ВКЛ" if chat_interaction_enabled else "ВЫКЛ"
     print(f"\n=== Реакция на чат {status} ===")
-
-
-# --- Функции для Шахмат ---
-
-async def initialize_chess_engine():
-    global chess_engine
-    if chess_engine:
-        return True
-    if not STOCKFISH_PATH or not os.path.exists(STOCKFISH_PATH):
-        print(f"ОШИБКА: Stockfish не найден: {STOCKFISH_PATH}")
-        await speak_text("Не могу найти шахматный движок.")
-        return False
-    try:
-        print(f"Инициализация Stockfish: {STOCKFISH_PATH}...")
-        transport, engine_proto = await chess.engine.popen_uci(STOCKFISH_PATH)
-        chess_engine = engine_proto
-        print("Stockfish инициализирован.")
-        return True
-    except Exception as e:
-        print(f"Критическая ошибка инициализации Stockfish: {e}")
-        await speak_text("Ошибка запуска шахматного модуля.")
-        chess_engine = None
-        return False
-
-
-async def close_chess_engine():
-    global chess_engine
-    if chess_engine:
-        print("Закрытие Stockfish...")
-        try:
-            await chess_engine.quit()
-        except Exception as e:
-            print(f"Ошибка при закрытии Stockfish: {e}")
-        finally:
-            chess_engine = None
-            print("Stockfish закрыт.")
-
-
-async def start_chess_game():
-    global is_chess_game_active, chess_board, chess_engine, player_color, bot_color
-    global gui_process, chess_game_task, is_processing_response, ipc_player_move_queue, GUI_SCRIPT_PATH
-
-    player_starts_as = random.choice([chess.WHITE, chess.BLACK])
-    player_color_str = "белыми" if player_starts_as == chess.WHITE else "черными"
-
-    print(f"Попытка запуска шахмат (голосом). Игрок будет играть {player_color_str}.")
-    if is_chess_game_active:
-        print("Игра уже идет.")
-        await speak_text("Мы уже играем!")
-        return
-    if is_processing_response:
-        print("Бот занят, старт отложен.")
-        await speak_text("Секунду, закончу и начнем.")
-        return
-    if not GUI_SCRIPT_PATH or not os.path.exists(GUI_SCRIPT_PATH):
-        print(f"ОШИБКА: Скрипт GUI не найден: {GUI_SCRIPT_PATH}")
-        await speak_text("Не могу найти файл доски.")
-        return
-    if not chess_engine and not await initialize_chess_engine():
-        return
-
-    is_processing_response = True
-    print("[INFO] Реакция на чат будет ОТКЛЮЧЕНА на время игры.")
-    await speak_text(f"Хорошо, Степан! Запускаю шахматы. Ты играешь {player_color_str}.")
-
-    try:
-        print(f"Запуск GUI: {GUI_SCRIPT_PATH}")
-        python_exe = sys.executable
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        gui_process = await asyncio.create_subprocess_exec(
-            python_exe, GUI_SCRIPT_PATH,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=creationflags
-        )
-        await asyncio.sleep(2)
-
-        if gui_process.returncode is not None:
-            stderr_gui = await gui_process.stderr.read()
-            error_msg = f"ОШИБКА: GUI завершился с кодом {gui_process.returncode}\nStderr: {stderr_gui.decode(errors='ignore')}"
-            print(error_msg)
-            gui_process = None
-            raise Exception("GUI не запустился")
-
-        print(f"GUI запущен (PID: {gui_process.pid}).")
-        chess_board = chess.Board()
-        player_color = player_starts_as
-        bot_color = not player_color
-        is_chess_game_active = True
-
-        while not ipc_player_move_queue.empty():
-            ipc_player_move_queue.get_nowait()
-
-        start_cmd = f"new_game {'white' if player_color == chess.WHITE else 'black'}\n"
-        print(f"Отправка в GUI: {start_cmd.strip()}")
-        try:
-            if gui_process.stdin:
-                gui_process.stdin.write(start_cmd.encode('utf-8'))
-                await gui_process.stdin.drain()
-            else:
-                raise IOError("Stdin GUI недоступен")
-        except (BrokenPipeError, ConnectionResetError, IOError) as e:
-            print(f"IPC Ошибка при старте GUI: {e}")
-            raise
-
-        chess_game_task = asyncio.create_task(chess_game_loop(), name="ChessGameLoop")
-        print("Шахматный игровой цикл запущен.")
-
-    except Exception as e:
-        print(f"Критическая ошибка старта шахмат: {e}")
-        await speak_text("Ой, что-то сломалось при запуске шахмат.")
-        if gui_process and gui_process.returncode is None:
-            try:
-                gui_process.terminate()
-                await gui_process.wait()
-            except Exception as e_term:
-                print(f"Ошибка терминации GUI при сбое старта: {e_term}")
-        gui_process = None
-        is_chess_game_active = False
-        chess_game_task = None
-    finally:
-        is_processing_response = False
-        print("[INFO] Блокировка снята после попытки старта.")
-
-
-async def stop_chess_game(reason="Игра остановлена."):
-    global is_chess_game_active, chess_board, player_color, bot_color
-    global gui_process, chess_game_task, ipc_player_move_queue, last_activity_time
-
-    print(f"Попытка остановки шахмат. Причина: {reason}")
-    if not is_chess_game_active:
-        print("Игра не активна.")
-        return
-
-    was_active = is_chess_game_active
-    is_chess_game_active = False  # Сначала флаг
-
-    if chess_game_task and not chess_game_task.done():
-        print("Отмена игрового цикла...")
-        chess_game_task.cancel()
-        try:
-            await chess_game_task
-        except asyncio.CancelledError:
-            print("Игровой цикл отменен.")
-        except Exception as e:
-            print(f"Ошибка ожидания отмены цикла: {e}")
-        chess_game_task = None
-
-    if gui_process and gui_process.returncode is None:
-        print(f"Остановка GUI (PID: {gui_process.pid})...")
-        try:
-            stop_cmd = "stop_game\n"
-            try:
-                if gui_process.stdin:
-                    gui_process.stdin.write(stop_cmd.encode('utf-8'))
-                    await gui_process.stdin.drain()
-                    await asyncio.sleep(0.5)
-                else:
-                    print("IPC: stdin GUI недоступен для 'stop_game'.")
-            except (BrokenPipeError, ConnectionResetError, AttributeError):
-                print("IPC: Канал в GUI закрыт/ошибка при 'stop_game'.")
-            except Exception as e_ipc_stop:
-                print(f"Ошибка отправки команды stop в GUI: {e_ipc_stop}")
-
-            if gui_process.returncode is None:
-                gui_process.terminate()
-                await gui_process.wait()
-                print("GUI терминирован.")
-            else:
-                print("GUI уже завершился.")
-        except ProcessLookupError:
-            print("GUI процесс не найден.")
-        except Exception as e:
-            print(f"Ошибка остановки GUI: {e}")
-        finally:
-            gui_process = None
-
-    # await close_chess_engine() # Опционально
-
-    chess_board = None;
-    player_color = None;
-    bot_color = None
-    while not ipc_player_move_queue.empty():
-        ipc_player_move_queue.get_nowait()
-
-    print(f"Шахматная игра остановлена. Причина: {reason}")
-    if was_active:
-        await speak_text(reason)
-    last_activity_time = time.time()
-    print("[INFO] Реакция на чат и монологи снова ВОЗМОЖНЫ.")
-
-
-async def parse_chess_move_from_text(text):
-    global chess_board
-    if not chess_board:
-        return None
-
-    text_lower = text.lower().strip()
-    san_pattern = r'\b([KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?|O-O(?:-O)?)[+#]?\b'
-    uci_pattern = r'\b[a-h][1-8][a-h][1-8][qrbn]?\b'
-    potential_moves = re.findall(uci_pattern, text_lower) + re.findall(san_pattern, text_lower)
-
-    print(f"Потенциальные ходы в '{text_lower}': {potential_moves}")
-    if not potential_moves:
-        return None
-
-    for move_str in potential_moves:
-        move = None
-        try:
-            move = chess_board.parse_uci(move_str)
-        except ValueError:
-            try:
-                move = chess_board.parse_san(move_str)
-            except ValueError:
-                continue
-
-        if move and chess_board.is_legal(move):
-            print(f"Распознан легальный ход: {move.uci()}")
-            return move
-    print(f"Не найдено легальных ходов в: '{text}'")
-    return None
-
-
-async def get_chess_commentary(move: chess.Move, player_name: str):
-    global chess_board, BOT_NAME_FOR_CHECK, is_processing_response
-    if not chess_board or not move: return None
-    if is_processing_response:
-        print("[Commentary] Пропуск, бот занят.")
-        return None
-
-    is_processing_response = True
-    commentary = None
-    try:
-        move_san = chess_board.san(move)
-        prompt = f"Шахматы: {player_name} сделал ход: {move_san}. " \
-                 f"FEN: {chess_board.fen()}. "
-        if chess_board.is_checkmate():
-            prompt += "Мат! "
-        elif chess_board.is_stalemate():
-            prompt += "Пат! "
-        elif chess_board.is_check():
-            prompt += "Шах! "
-        elif chess_board.is_capture(move):
-            prompt += "Взятие. "
-        prompt += f"Я {BOT_NAME_FOR_CHECK}. Дай краткий (1-2 предл.), остроумный/аналитический комментарий к ходу."
-
-        commentary = await get_ollama_response(prompt)
-        if commentary:
-            print(f"Комментарий к ходу {move_san}: {commentary}")
-        else:
-            print(f"Не сгенерирован комментарий к {move_san}.")
-    except Exception as e:
-        print(f"Ошибка комментария: {e}")
-    finally:
-        is_processing_response = False
-        return commentary
-
-
-async def chess_game_loop():
-    global is_chess_game_active, chess_board, chess_engine, player_color, bot_color
-    global gui_process, ipc_player_move_queue, is_processing_response
-
-    print("Игровой цикл: Запущен.")
-    # Задача чтения вывода GUI запускается здесь
-    gui_reader_task = asyncio.create_task(read_gui_output(gui_process.stdout), name="GuiOutputReader")
-
-    while is_chess_game_active:
-        try:
-            if chess_board.is_game_over(claim_draw=True):
-                outcome = chess_board.outcome(claim_draw=True)
-                winner = outcome.winner
-                reason = f"Игра завершена! {outcome.termination.name.capitalize()}. "
-                if winner is not None:
-                    winner_name = "Белые" if winner == chess.WHITE else "Черные"
-                    reason += f"Победили {winner_name}."
-                    reason += " Я выиграл!" if winner == bot_color else " Ты выиграл!"
-                else:
-                    reason += "Ничья."
-                print(f"Игровой цикл: {reason}")
-                await stop_chess_game(reason)
-                break
-
-            move_made = None
-            commentary_source = ""
-
-            if chess_board.turn == player_color:  # Ход Игрока
-                print("Игровой цикл: Ожидание хода игрока...")
-                try:
-                    player_move_uci = await asyncio.wait_for(ipc_player_move_queue.get(), timeout=600.0)
-                    if player_move_uci is None:
-                        await stop_chess_game("Сигнал остановки.")
-                        break
-                    move = chess.Move.from_uci(player_move_uci)
-                    if chess_board.is_legal(move):
-                        move_made = move
-                        commentary_source = "Степан"
-                    else:
-                        print(f"Нелегальный ход: {player_move_uci}")
-                        await speak_text("Так ходить нельзя.")
-                        continue  # Ждем следующий ход
-                except asyncio.TimeoutError:
-                    await stop_chess_game("Время вышло.")
-                    break
-                except asyncio.CancelledError:
-                    print("Ожидание игрока отменено.")
-                    break
-                except Exception as e:
-                    print(f"Ошибка ожидания игрока: {e}")
-                    await stop_chess_game("Ошибка.")
-                    break
-            else:  # Ход Бота
-                print("Игровой цикл: Ход бота...")
-                if not chess_engine:
-                    await stop_chess_game("Ошибка движка.")
-                    break
-                if is_processing_response:
-                    await asyncio.sleep(0.5)
-                    continue
-
-                try:
-                    result = await asyncio.wait_for(chess_engine.play(chess_board, chess.engine.Limit(time=5.0)),
-                                                    timeout=10.0)
-                    move_made = result.move
-                    commentary_source = f"Я ({BOT_NAME_FOR_CHECK})"
-                    move_cmd = f"move {move_made.uci()}\n"
-                    print(f"Отправка бот-хода в GUI: {move_cmd.strip()}")
-                    try:
-                        if gui_process and gui_process.returncode is None and gui_process.stdin:
-                            gui_process.stdin.write(move_cmd.encode('utf-8'))
-                            await gui_process.stdin.drain()
-                        else:
-                            raise BrokenPipeError("GUI недоступен")
-                    except (BrokenPipeError, ConnectionResetError) as e:
-                        print(f"IPC Ошибка: {e}")
-                        await stop_chess_game("Потеря связи.")
-                        break
-                except Exception as e:
-                    print(f"Ошибка хода бота ({type(e)}): {e}")
-                    await stop_chess_game("Ошибка движка.")
-                    break
-
-            # Обработка сделанного хода
-            if move_made:
-                print(f"Игровой цикл: Обработка хода {move_made.uci()} от {commentary_source}")
-                commentary = await get_chess_commentary(move_made, commentary_source)
-                chess_board.push(move_made)
-                print(f"Позиция:\n{chess_board}")
-                if commentary:
-                    await speak_text(commentary)
-
-            await asyncio.sleep(0.1)
-
-        except asyncio.CancelledError:
-            print("Игровой цикл: Отменен.")
-            break
-        except Exception as e:
-            print(f"Игровой цикл: Ошибка: {e}")
-            await stop_chess_game("Критическая ошибка.")
-            break
-
-    print("Игровой цикл: Завершен.")
-    if gui_reader_task and not gui_reader_task.done():
-        gui_reader_task.cancel()
-        try:
-            await gui_reader_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e_wait_reader:
-            print(f"Ошибка ожидания gui_reader_task: {e_wait_reader}")
-    print("Игровой цикл: Чтение GUI остановлено.")
-
-
-async def read_gui_output(stream_reader):
-    global ipc_player_move_queue, is_chess_game_active
-    print("Чтение GUI: Запущено.")
-    while is_chess_game_active and stream_reader and not stream_reader.at_eof():
-        try:
-            line_bytes = await stream_reader.readline()
-            if not line_bytes:
-                print("Чтение GUI: EOF.")
-                break
-            line = line_bytes.decode(errors='ignore').strip()
-            if line.startswith("MOVE:"):
-                move_uci = line.split(":", 1)[1].strip()
-                if re.fullmatch(r'[a-h][1-8][a-h][1-8][qrbn]?', move_uci):
-                    await ipc_player_move_queue.put(move_uci)
-                else:
-                    print(f"Чтение GUI: Некорректный ход: {move_uci}")
-            elif line == "GUI_CLOSED":
-                print("Чтение GUI: Сигнал закрытия.")
-                break
-        except asyncio.CancelledError:
-            print("Чтение GUI: Отменено.");
-            break
-        except ConnectionResetError:
-            print("Чтение GUI: Соединение разорвано.");
-            break
-        except Exception as e:
-            print(f"Чтение GUI: Ошибка: {e}");
-            await asyncio.sleep(1)
-    print("Чтение GUI: Завершено.")
-    if is_chess_game_active:
-        await stop_chess_game("Графическая доска закрылась или потеряна связь.")
 
 
 # --- Twitch бот ---
@@ -801,16 +502,17 @@ class SimpleBot(twitchio.Client):
         if message.echo:
             return
 
-        global chat_interaction_enabled, is_chess_game_active, is_processing_response
+        global chat_interaction_enabled, is_processing_response
         global last_activity_time, BOT_NAME_FOR_CHECK, OBS_OUTPUT_FILE, stt_enabled, audio_queue
+        global vertexai_initialized_successfully  # Проверяем флаг
 
-        # Игнор чата во время игры или если отключен хоткеем
-        if is_chess_game_active or not chat_interaction_enabled:
+        if not chat_interaction_enabled:
             return
         if message.channel.name != self.target_channel_name:
             return
+        if not vertexai_initialized_successfully:  # Не отвечаем, если Vertex не готов
+            return
 
-        # Реагируем только на упоминание или хайлайт
         content_lower = message.content.lower()
         trigger_parts = [p.lower() for p in BOT_NAME_FOR_CHECK.split() if len(p) > 2]
         mentioned = any(trig in content_lower for trig in trigger_parts)
@@ -840,9 +542,9 @@ class SimpleBot(twitchio.Client):
             except Exception as e:
                 print(f"[{current_time}] Ошибка очистки OBS: {e}")
 
-            llm_response = await get_ollama_response(f"(Чат от {message.author.name}): {message.content}")
+            llm_response = await get_vertexai_response(f"(Чат от {message.author.name}): {message.content}")
             if llm_response:
-                print(f"[{current_time}] Ответ Ollama (чат): {llm_response}")
+                print(f"[{current_time}] Ответ Vertex AI (чат): {llm_response}")
                 try:
                     open(OBS_OUTPUT_FILE, 'w', encoding='utf-8').write(llm_response)
                 except Exception as e:
@@ -852,13 +554,13 @@ class SimpleBot(twitchio.Client):
                     audio_queue.queue.clear()
                 last_activity_time = time.time()
             else:
-                print(f"[{current_time}] Нет ответа Ollama для {message.author.name}.")
+                print(f"[{current_time}] Нет ответа Vertex AI для {message.author.name}.")
             if stt_was_on:
                 print("[INFO] Вкл STT после ответа (чат).")
                 stt_enabled = True
         except Exception as e:
             print(f"[{current_time}] КРИТ. ОШИБКА event_message: {e}")
-            if stt_was_on:  # Пытаемся восстановить STT
+            if stt_was_on:
                 stt_enabled = True
         finally:
             is_processing_response = False
@@ -867,7 +569,8 @@ class SimpleBot(twitchio.Client):
 
 # --- Цикл обработки STT ---
 async def stt_processing_loop():
-    global audio_queue, recording_active, stt_model, stt_enabled, is_processing_response, is_chess_game_active
+    
+    global audio_queue, recording_active, stt_model, stt_enabled, is_processing_response
     silence_blocks = int(VAD_SILENCE_TIMEOUT_MS / (BLOCKSIZE / SOURCE_SAMPLE_RATE * 1000))
     min_speech = int(VAD_MIN_SPEECH_MS / (BLOCKSIZE / SOURCE_SAMPLE_RATE * 1000))
     pad_blocks = int(VAD_SPEECH_PAD_MS / (BLOCKSIZE / SOURCE_SAMPLE_RATE * 1000))
@@ -906,13 +609,14 @@ async def stt_processing_loop():
 
 # --- Обработка распознанной речи ---
 async def process_recognized_speech(audio_buffer_list, source_id="STT"):
-    """Обрабатывает распознанный текст: команды, ходы, обычный диалог."""
     global is_processing_response, stt_enabled, audio_queue, last_activity_time
-    global is_chess_game_active, ipc_player_move_queue, OBS_OUTPUT_FILE
+    global OBS_OUTPUT_FILE, vertexai_initialized_successfully  # Проверяем флаг
+
+    if not vertexai_initialized_successfully:  # Не обрабатываем, если Vertex не готов
+        return
 
     current_time = datetime.datetime.now().strftime('%H:%M:%S')
 
-    # Распознаем речь
     full_audio = np.concatenate(audio_buffer_list, axis=0)
     mono = full_audio.mean(axis=1) if SOURCE_CHANNELS > 1 else full_audio
     resampled = resample_audio(mono, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE)
@@ -922,62 +626,20 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
 
     if not recognized_text:
         print(f"STT: Не распознано ({source_id}).")
-        return  # Ничего не делаем, если речь не распознана
+        return
 
     last_activity_time = time.time()
     print(f"STT Распознано ({source_id}): {recognized_text}")
-    text_lower = recognized_text.lower()
 
-    # --- ПРОВЕРКА ШАХМАТНЫХ КОМАНД ---
-    start_phrases = ["джордж давай в шахматы", "сыграем в шахматы", "запусти шахматы"]
-    stop_phrases = ["джордж хватит играть", "стоп игра", "останови шахматы", "закончить партию"]
-
-    if any(p in text_lower for p in start_phrases):
-        print("Голос: СТАРТ шахмат.")
-        await start_chess_game()
-        return  # Команда обработана, выходим
-
-    if any(p in text_lower for p in stop_phrases):
-        print("Голос: СТОП шахмат.")
-        await stop_chess_game()
-        return  # Команда обработана, выходим
-
-    # --- ПРОВЕРКА ШАХМАТНОГО ХОДА (ЕСЛИ ИГРА ИДЕТ) ---
-    if is_chess_game_active:
-        print("Игра активна, парсинг хода...")
-        parsed_move = await parse_chess_move_from_text(recognized_text)
-        if parsed_move:
-            print(f"Голос: Ход {parsed_move.uci()}. В очередь.")
-            # Не ставим флаг, просто отправляем ход в игровой цикл
-            await ipc_player_move_queue.put(parsed_move.uci())
-            return  # Ход обработан, выходим
-        else:
-            # Если игра идет, но это не ход и не команда стоп - просто игнорируем,
-            # чтобы не забивать эфир сообщениями "не понял ход" на каждое слово.
-            # Или можно добавить короткое TTS-сообщение об ошибке, НО нужно ставить флаг
-            print("Не распознан ход во время активной игры.")
-            # Если нужна реакция, то ставим флаг и говорим:
-            # if not is_processing_response: # Проверяем, не занят ли уже TTS
-            #     try:
-            #         is_processing_response = True
-            #         await speak_text("Не понял твой ход, Степан.")
-            #     finally:
-            #         is_processing_response = False
-            return  # Выходим
-
-    # --- ЕСЛИ ЭТО НЕ ШАХМАТНАЯ КОМАНДА/ХОД - ОБЫЧНАЯ ОБРАБОТКА РЕЧИ ---
-    # Вот теперь можно ставить флаг, т.к. мы будем обращаться к Ollama/TTS
     if is_processing_response:
         print(f"[{current_time}] Бот занят (перед обычной обработкой). Игнор {source_id}.")
-        return  # Выходим, если бот уже занят другим процессом
+        return
 
     stt_was_initially_enabled = stt_enabled
     try:
-        is_processing_response = True  # Ставим флаг ЗДЕСЬ
+        is_processing_response = True
         print(f"[{current_time}] НАЧАЛО обработки ОБЫЧНОЙ речи ({source_id}).")
-        print("Обработка как обычное голосовое сообщение...")
 
-        # Отключаем STT на время ответа БОТА
         if stt_enabled:
             print(f"[INFO] Откл STT для ответа ({source_id}).")
             stt_enabled = False
@@ -985,31 +647,29 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
             audio_queue.queue.clear()
 
         try:
-            open(OBS_OUTPUT_FILE, 'w').close()  # Очистка OBS
+            open(OBS_OUTPUT_FILE, 'w').close()
         except Exception as e:
             print(f"[{current_time}] Ошибка очистки OBS: {e}")
 
-        llm_response = await get_ollama_response(f"(Голос Степана): {recognized_text}")
+        llm_response = await get_vertexai_response(f"(Голос Степана): {recognized_text}")
         if llm_response:
-            print(f"[{current_time}] Ответ Ollama ({source_id}): {llm_response}")
+            print(f"[{current_time}] Ответ Vertex AI ({source_id}): {llm_response}")
             try:
                 open(OBS_OUTPUT_FILE, 'w', encoding='utf-8').write(llm_response)
             except Exception as e:
                 print(f"[{current_time}] Ошибка записи в OBS: {e}")
 
-            # TTS для ответа (speak_text сам управляет tts_lock)
             await speak_text(llm_response)
             with audio_queue.mutex:
                 audio_queue.queue.clear()
-            last_activity_time = time.time()  # Обновляем время активности
+            last_activity_time = time.time()
         else:
-            print(f"[{current_time}] Нет ответа Ollama ({source_id}).")
+            print(f"[{current_time}] Нет ответа Vertex AI ({source_id}).")
 
     except Exception as e:
         print(f"[{current_time}] КРИТ. ОШИБКА process_speech ({source_id}): {e}")
     finally:
-        is_processing_response = False  # Снимаем основную блокировку
-        # Восстанавливаем STT в состояние, которое было ДО начала этой функции
+        is_processing_response = False
         stt_enabled = stt_was_initially_enabled
         print(f"[{current_time}] КОНЕЦ обработки речи ({source_id}). STT: {stt_enabled}.")
 
@@ -1017,16 +677,17 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
 # --- Цикл монологов ---
 async def monologue_loop():
     global last_activity_time, recording_active, stt_enabled, BOT_NAME_FOR_CHECK
-    global audio_queue, is_processing_response, is_chess_game_active, chat_interaction_enabled
+    global audio_queue, is_processing_response, chat_interaction_enabled
+    global vertexai_initialized_successfully  # Проверяем флаг
 
     print("Цикл монологов: Запущен.")
     while recording_active.is_set():
         await asyncio.sleep(15)
-        if is_chess_game_active or is_processing_response or not chat_interaction_enabled:
+        if is_processing_response or not chat_interaction_enabled or not vertexai_initialized_successfully:
             continue
         if time.time() - last_activity_time > INACTIVITY_THRESHOLD_SECONDS:
             current_time = datetime.datetime.now().strftime('%H:%M:%S')
-            if is_processing_response or is_chess_game_active or not chat_interaction_enabled:
+            if is_processing_response or not chat_interaction_enabled or not vertexai_initialized_successfully:
                 continue
 
             stt_was_initially_enabled = stt_enabled
@@ -1040,7 +701,7 @@ async def monologue_loop():
                     audio_queue.queue.clear()
 
                 prompt = f"Сгенерируй короткую (1-2 предл.) реплику от {BOT_NAME_FOR_CHECK} для заполнения тишины."
-                llm_response = await get_ollama_response(prompt)
+                llm_response = await get_vertexai_response(prompt)
                 if llm_response:
                     print(f"[{current_time}] Монолог: {llm_response}")
                     try:
@@ -1057,15 +718,16 @@ async def monologue_loop():
                 print(f"[{current_time}] КРИТ. ОШИБКА monologue_loop: {e}")
             finally:
                 is_processing_response = False
-                stt_enabled = stt_was_initially_enabled  # Восстанавливаем STT
+                stt_enabled = stt_was_initially_enabled
                 print(f"[{current_time}] КОНЕЦ монолога. STT: {stt_enabled}.")
     print("Цикл монологов: Остановлен.")
 
 
-# --- Поток хоткеев ---
+# --- Поток хоткеев (исправлен апостроф) ---
 def hotkey_listener_thread():
     stt_hotkey = 'ctrl+;'
-    chat_hotkey = "ctrl+apostrophe"
+    # Используем ' для апострофа
+    chat_hotkey = "ctrl+'"
     reg_stt, reg_chat = False, False
     try:
         print(f"\nХоткей STT: '{stt_hotkey}', Хоткей Чата: '{chat_hotkey}'")
@@ -1080,24 +742,37 @@ def hotkey_listener_thread():
         print("\nОШИБКА: 'keyboard' не найден.");
         return
     except Exception as e:
-        print(f"\nОшибка hotkey_listener: {e}");
+        # Выводим более детальную ошибку, если она не ValueError с именем клавиши
+        if not (isinstance(e, ValueError) and "is not mapped" in str(e)):
+            print(f"\nОшибка hotkey_listener: {e}");
+        else:
+            # Игнорируем или логируем тихо ошибку маппинга, т.к. она может быть временной
+            print(f"\nПредупреждение: Не удалось зарегистрировать хоткей (возможно, проблема с раскладкой?): {e}")
+            if "apostrophe" in chat_hotkey:  # Если старый вариант остался случайно
+                print("-> Попробуйте заменить 'apostrophe' на одинарную кавычку ' в коде.")
+
     finally:
         try:
+            # Удаляем только то, что успешно зарегистрировали
             if reg_stt: keyboard.remove_hotkey(stt_hotkey)
             if reg_chat: keyboard.remove_hotkey(chat_hotkey)
             print("Хоткеи удалены.")
-        except Exception as e:
-            print(f"Ошибка удаления хоткеев: {e}")
+        except Exception as e_rem:
+            print(f"Ошибка удаления хоткеев: {e_rem}")
         print("Поток хоткеев завершен.")
 
 
 # --- Основная функция ---
 async def main_async():
-    global chess_engine, is_chess_game_active, recording_active
+    global recording_active, vertexai_initialized_successfully
     print("Запуск AI Twitch Bot...");
     if not TWITCH_ACCESS_TOKEN:
         print("ОШИБКА: Нет TWITCH_ACCESS_TOKEN!");
         return
+    # Проверка флага после инициализации
+    if not vertexai_initialized_successfully:
+        print("ОШИБКА: Vertex AI не инициализирован успешно. Бот не сможет отвечать.")
+        # return # Можно остановить бота здесь
 
     client = SimpleBot(token=TWITCH_ACCESS_TOKEN, initial_channels=[TWITCH_CHANNEL])
     twitch_task = asyncio.create_task(client.start(), name="TwitchIRC")
@@ -1113,8 +788,10 @@ async def main_async():
                 exc = task.exception()
                 if exc:
                     print(f"\n!!! ОШИБКА Задачи {task.get_name()}: {exc} !!!", file=sys.stderr)
-                    task.print_stack()
-                    if task in [twitch_task, stt_task]:
+                    # Печать стека может помочь в отладке
+                    # import traceback
+                    # traceback.print_exception(type(exc), exc, exc.__traceback__)
+                    if task in [twitch_task, stt_task]:  # Критичные задачи
                         print("Критическая ошибка, инициирую остановку...")
                         recording_active.clear()
                 elif task.cancelled():
@@ -1126,22 +803,11 @@ async def main_async():
             except Exception as e:
                 print(f"Ошибка проверки задачи {task.get_name()}: {e}")
 
-        global chess_game_task
-        if chess_game_task and chess_game_task.done():
-            print("Игровой цикл завершился.")
-            try:
-                chess_game_task.result()  # Проверить исключения
-            except Exception as e_chess_done:
-                print(f"Ошибка игрового цикла: {e_chess_done}")
-            chess_game_task = None
-
         if not recording_active.is_set() or not active_tasks:
             break
         await asyncio.sleep(1)
 
     print("\n" + "=" * 10 + " Завершение работы (main_async) " + "=" * 10)
-    if is_chess_game_active:
-        await stop_chess_game("Завершение бота.")
     current_tasks = asyncio.all_tasks()
     tasks_to_cancel = [t for t in current_tasks if not t.done() and t is not asyncio.current_task()]
     if tasks_to_cancel:
@@ -1151,7 +817,6 @@ async def main_async():
     if client and client.is_connected():
         await client.close()
         print("Клиент Twitch закрыт.")
-    await close_chess_engine()
     print("Завершение main_async завершено.")
 
 
@@ -1159,15 +824,56 @@ async def main_async():
 if __name__ == "__main__":
     print("-" * 40);
     print("Запуск программы...")
+    # Первичные проверки .env
     if not all([TWITCH_ACCESS_TOKEN, TWITCH_CHANNEL]):
-        print("ОШИБКА: Заполните .env!");
+        print("ОШИБКА: Заполните .env (Twitch)!");
         sys.exit(1)
-    if not STOCKFISH_PATH or not os.path.exists(STOCKFISH_PATH):
-        print(f"ПРЕДУПРЕЖДЕНИЕ: Stockfish не найден!");
-        STOCKFISH_PATH = None
-    if not GUI_SCRIPT_PATH or not os.path.exists(GUI_SCRIPT_PATH):
-        print(f"ПРЕДУПРЕЖДЕНИЕ: Скрипт GUI не найден!");
-        GUI_SCRIPT_PATH = None
+    if not all([os.getenv('VERTEXAI_PROJECT_ID'), os.getenv('VERTEXAI_LOCATION'), os.getenv('VERTEXAI_MODEL_NAME')]):
+        print("ОШИБКА: Заполните .env (Vertex AI: ID проекта, регион, модель БЕЗ meta/)!");
+        # sys.exit(1) # Можно остановить тут, если хотите
+
+    # Вызываем инициализацию Vertex AI здесь
+    initialize_vertexai()
+
+    # --- Загрузка модели Faster Whisper ---
+    stt_model = None  # Определяем переменную до try
+    try:
+        from faster_whisper import WhisperModel
+
+        print(f"Загрузка faster-whisper '{STT_MODEL_SIZE}'...")
+        stt_model = WhisperModel(STT_MODEL_SIZE, device=STT_DEVICE, compute_type=STT_COMPUTE_TYPE)
+        print("Модель faster-whisper загружена.")
+    except ImportError:
+        print("ОШИБКА: faster-whisper не установлен.")
+        stt_model = None
+    except Exception as e:
+        print(f"Критическая ошибка загрузки faster-whisper: {e}")
+        stt_model = None
+    # --- КОНЕЦ БЛОКА ЗАГРУЗКИ STT ---
+
+    # --- Чтение Sample Rate из конфига голоса Piper ---
+    piper_sample_rate = None  # Определяем переменную до try
+    try:
+        if os.path.exists(VOICE_CONFIG_PATH):
+            with open(VOICE_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                piper_sample_rate = json.load(f).get('audio', {}).get('sample_rate')
+            if piper_sample_rate:
+                print(f"Piper SR: {piper_sample_rate}")
+            else:
+                print(f"ОШИБКА: Не найден 'sample_rate' в {VOICE_CONFIG_PATH}")
+        else:
+            print(f"ОШИБКА: Не найден JSON конфиг голоса: {os.path.abspath(VOICE_CONFIG_PATH)}")
+
+        if not all([os.path.exists(PIPER_EXE_PATH), os.path.exists(VOICE_MODEL_PATH), piper_sample_rate]):
+            print("ОШИБКА: TTS (Piper) не будет работать.")
+            piper_sample_rate = None
+    except Exception as e:
+        print(f"Критическая ошибка инициализации Piper TTS: {e}")
+        piper_sample_rate = None
+    # --- КОНЕЦ БЛОКА НАСТРОЙКИ TTS ---
+
+    if not vertexai_initialized_successfully:
+        print("Предупреждение: Vertex AI не инициализирован успешно. Бот не сможет отвечать.")
     if not stt_model: print("Предупреждение: STT не загружена.")
     if not piper_sample_rate: print("Предупреждение: TTS не инициализирован.")
     print("-" * 40)
@@ -1211,6 +917,7 @@ if __name__ == "__main__":
         print(f"Критическая ошибка главного цикла: {e_loop}");
         recording_active.clear()
     finally:
+        # Завершение
         print("\n" + "=" * 10 + " Финальное завершение " + "=" * 10)
         recording_active.clear()
 
