@@ -397,9 +397,6 @@ async def get_vertexai_response(user_message):
 
     is_monologue_request = user_message.startswith("Сгенерируй короткое")
 
-    # --- Формирование истории для generate_content ---
-    # generate_content ожидает список Content объектов (а не словарей)
-    # Системный промпт уже передан при создании model_instance
     vertex_history = []
     current_msg_obj = None  # Для локальной истории
 
@@ -413,23 +410,16 @@ async def get_vertexai_response(user_message):
         # Для монолога - только сам запрос
         history_to_convert = [{"role": "user", "content": user_message}]
 
-    # Конвертируем историю в формат Content/Part
-    # Важно: модель ожидает чередование user -> model -> user -> model ...
-    # Роль 'system' не используется здесь, т.к. она задана в system_instruction
     for msg in history_to_convert:
         role = msg["role"]
-        # Роль 'assistant' должна быть 'model' для этого API
         if role == "assistant":
             role = "model"
-        # Пропускаем неизвестные роли (на всякий случай)
         if role not in ["user", "model"]:
             continue
         try:
-            # Создаем Content объект с правильной ролью и текстом
             vertex_history.append(Content(role=role, parts=[Part.from_text(msg["content"])]))
         except Exception as e_content:
             print(f"Ошибка создания Vertex AI Content для сообщения: {msg}. Ошибка: {e_content}", file=sys.stderr)
-            # Пропускаем это сообщение, чтобы не сломать запрос
             continue
 
     # --- Конфигурация генерации ---
@@ -442,9 +432,6 @@ async def get_vertexai_response(user_message):
 
     try:
         print(f"Vertex AI GenerativeModel Запрос к: {VERTEXAI_MODEL_NAME}")
-        # print(f"DEBUG: Отправляемая история: {vertex_history}") # Раскомментируй для отладки
-
-        # Асинхронный вызов generate_content
         response = await asyncio.to_thread(
             vertexai_model_instance.generate_content,
             contents=vertex_history,
@@ -452,17 +439,14 @@ async def get_vertexai_response(user_message):
         )
         print("Vertex AI GenerativeModel Ответ получен.")
 
-        # --- Парсинг ответа ---
-        # Ожидаем, что ответ будет в response.text (или response.candidates[0].content.parts[0].text)
         if response.candidates and response.candidates[0].content.parts:
             content = response.candidates[0].content.parts[0].text
-        elif hasattr(response, 'text'):  # Простой .text может быть доступен для простых ответов
+        elif hasattr(response, 'text'):
             content = response.text
         else:
             content = None  # Не смогли извлечь ответ
 
         if content:
-            # Обновляем локальную историю, если это не монолог и был запрос пользователя
             if not is_monologue_request and current_msg_obj:
                 conversation_history.extend([current_msg_obj, {"role": "assistant", "content": content.strip()}])
                 if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
@@ -471,12 +455,6 @@ async def get_vertexai_response(user_message):
         else:
             print(f"Vertex AI пустой или нераспознанный ответ: {response}", file=sys.stderr)
             return None
-        # --- Конец парсинга ---
-
-    # Обработка специфичных ошибок Vertex AI (если нужно)
-    # except vertexai.generative_models._generative_models.BlockedPromptException as e_blocked:
-    #    print(f"Ошибка Vertex AI: Запрос заблокирован системой безопасности. Причина: {e_blocked}", file=sys.stderr)
-    #    return None
     except Exception as e:
         print(f"Ошибка Vertex AI GenerativeModel ({type(e).__name__}): {e}", file=sys.stderr)
         # Попробуем вывести детали ошибки, если они есть
@@ -489,7 +467,7 @@ async def get_vertexai_response(user_message):
 
 
 def play_raw_audio_sync(audio_bytes, samplerate, dtype='int16'):
-    global chosen_output_device_id  # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
+    global chosen_output_device_id
     if not audio_bytes or not samplerate:
         return
     try:
