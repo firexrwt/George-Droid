@@ -1,6 +1,7 @@
-# main.py
 import os
 import sys
+from typing import Any
+
 import keyboard
 from dotenv import load_dotenv
 import twitchio
@@ -114,6 +115,7 @@ is_processing_response = False
 tts_lock = asyncio.Lock()
 vertexai_initialized_successfully = False  # Флаг успешной инициализации
 vertexai_model_instance = None  # Глобальный экземпляр модели
+chosen_output_device_id = None
 
 # --- Системный промпт ---
 SYSTEM_PROMPT = """## Твоя Личность: Джордж Дроид
@@ -238,6 +240,90 @@ def initialize_vertexai():
 
 
 # --- Вспомогательные функции ---
+
+def list_audio_devices(kind='output'):
+    """Lists available audio devices of a specific kind."""
+    devices = sd.query_devices()
+    valid_devices = []
+    print(f"\nДоступные устройства вывода ({kind}):")
+    for i, device in enumerate(devices):
+        # Check if the device is an output device and has a valid host API
+        # (This helps filter out some non-playback devices)
+        if device['max_output_channels'] > 0 and device['hostapi'] != 0:  # Basic check for output capability
+            # You might need to adjust hostapi filtering based on your system
+            print(f"  {len(valid_devices)}. {device['name']} (ID: {device['index']})")
+            valid_devices.append(device)
+    return valid_devices
+
+
+def choose_audio_output_device():
+    """Prompts the user to choose an audio output device AND SETS THE GLOBAL VARIABLE."""
+    global chosen_output_device_id  # Объявляем, что будем менять глобальную переменную
+
+    output_devices = list_audio_devices()
+    if not output_devices:
+        print("Не найдено подходящих устройств вывода. Будет использовано системное по умолчанию (если доступно).")
+        try:
+            # Пытаемся установить устройство вывода по умолчанию системы
+            default_output_idx = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) and len(
+                sd.default.device) > 1 else sd.default.device
+            if default_output_idx != -1:  # Убедимся, что есть валидное устройство по умолчанию
+                chosen_output_device_id = default_output_idx
+                print(
+                    f"Установлено системное устройство вывода по умолчанию: ID {chosen_output_device_id} ({sd.query_devices(chosen_output_device_id)['name']})")
+            else:
+                print("Не удалось определить системное устройство вывода по умолчанию.")
+                chosen_output_device_id = None
+        except Exception as e_default:
+            print(f"Ошибка при попытке установить системное устройство вывода по умолчанию: {e_default}")
+            chosen_output_device_id = None
+        return  # Выходим из функции
+
+    while True:
+        try:
+            default_device_prompt_info = ""
+            try:
+                default_output_idx_for_prompt = sd.default.device[1] if isinstance(sd.default.device,
+                                                                                   (list, tuple)) and len(
+                    sd.default.device) > 1 else sd.default.device
+                if default_output_idx_for_prompt != -1:
+                    default_device_prompt_info = f" [{default_output_idx_for_prompt}]"
+            except:
+                pass
+
+            choice_str = input(
+                f"Выберите номер устройства вывода (или Enter для системного по умолчанию{default_device_prompt_info}): ")
+
+            if not choice_str:
+                try:
+                    default_output_idx = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) and len(
+                        sd.default.device) > 1 else sd.default.device
+                    if default_output_idx != -1:
+                        chosen_output_device_id = default_output_idx
+                        print(
+                            f"Используется системное устройство вывода по умолчанию: ID {chosen_output_device_id} ({sd.query_devices(chosen_output_device_id)['name']})")
+                    else:
+                        print("Не удалось определить системное устройство вывода по умолчанию. Выбор не сделан.")
+                        chosen_output_device_id = None
+                except Exception as e_enter_default:
+                    print(f"Ошибка при выборе системного устройства по умолчанию (Enter): {e_enter_default}")
+                    chosen_output_device_id = None
+                return
+
+            device_index_in_list = int(choice_str)
+            if 0 <= device_index_in_list < len(output_devices):
+                chosen_device_info = output_devices[device_index_in_list]
+                chosen_output_device_id = chosen_device_info['index']
+                print(f"Выбрано и установлено глобально: {chosen_device_info['name']} (ID: {chosen_output_device_id})")
+                return  # Выходим из функции
+            else:
+                print("Неверный номер. Попробуйте снова.")
+        except ValueError:
+            print("Неверный ввод. Введите число.")
+        except Exception as e:
+            print(f"Ошибка выбора устройства: {e}")
+            chosen_output_device_id = None
+            return
 
 def resample_audio(audio_data: np.ndarray, input_rate: int, target_rate: int) -> np.ndarray:
     
@@ -399,15 +485,16 @@ async def get_vertexai_response(user_message):
         return None
 
 
-# --- КОНЕЦ НОВОЙ ВЕРСИИ ---
+
 
 
 def play_raw_audio_sync(audio_bytes, samplerate, dtype='int16'):
-    
+    global chosen_output_device_id  # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
     if not audio_bytes or not samplerate:
         return
     try:
-        sd.play(np.frombuffer(audio_bytes, dtype=dtype), samplerate=samplerate, blocking=True)
+        sd.play(np.frombuffer(audio_bytes, dtype=dtype), samplerate=samplerate, blocking=True,
+                device=chosen_output_device_id)
     except Exception as e:
         print(f"Ошибка sd.play: {e}", file=sys.stderr)
 
@@ -456,11 +543,12 @@ async def speak_text(text_to_speak):
 
         if audio_bytes:
             try:
-                await asyncio.to_thread(play_raw_audio_sync, audio_bytes, piper_sample_rate)
+
+                await asyncio.to_thread(play_raw_audio_sync, audio_bytes,
+                                        piper_sample_rate)
             except Exception as e_play:
                 print(f"Ошибка play audio: {e_play}", file=sys.stderr)
-        print(f"[TTS] Озвучка завершена.")
-
+            print(f"[TTS] Озвучка завершена.")
 
 def toggle_stt():
     
@@ -822,14 +910,23 @@ async def main_async():
 
 # --- Точка входа ---
 if __name__ == "__main__":
-    print("-" * 40);
+
+    print("-" * 40)
     print("Запуск программы...")
+
+    choose_audio_output_device()
+
+    if chosen_output_device_id is not None:
+        print(f"Проверка в __main__: Глобальное устройство вывода ID: {chosen_output_device_id}")
+    else:
+        print("Проверка в __main__: Устройство вывода не было установлено.")
+
     # Первичные проверки .env
     if not all([TWITCH_ACCESS_TOKEN, TWITCH_CHANNEL]):
-        print("ОШИБКА: Заполните .env (Twitch)!");
+        print("ОШИБКА: Заполните .env (Twitch)!")
         sys.exit(1)
     if not all([os.getenv('VERTEXAI_PROJECT_ID'), os.getenv('VERTEXAI_LOCATION'), os.getenv('VERTEXAI_MODEL_NAME')]):
-        print("ОШИБКА: Заполните .env (Vertex AI: ID проекта, регион, модель БЕЗ meta/)!");
+        print("ОШИБКА: Заполните .env (Vertex AI: ID проекта, регион, модель БЕЗ meta/)!")
         # sys.exit(1) # Можно остановить тут, если хотите
 
     # Вызываем инициализацию Vertex AI здесь
