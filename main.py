@@ -96,7 +96,7 @@ OBS_OUTPUT_FILE = "obs_ai_response.txt"
 
 STT_MODEL_SIZE = "medium"
 STT_DEVICE = "cuda"
-STT_COMPUTE_TYPE = "int8_float16"
+STT_COMPUTE_TYPE = "int8"
 
 SOURCE_SAMPLE_RATE = 48000
 SOURCE_CHANNELS = 2
