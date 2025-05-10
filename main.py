@@ -20,6 +20,10 @@ import queue
 import threading
 import random
 import re
+from PIL import Image  # Pillow для обработки изображений
+import mss  # Для скриншотов
+import tempfile  # Для временных файлов
+import base64
 
 load_dotenv()
 
@@ -28,20 +32,25 @@ TOGETHER_API_KEY = os.getenv('TOGETHER_API_KEY')
 TOGETHER_MODEL_ID = os.getenv('TOGETHER_MODEL_ID', "meta-llama/Llama-4-Scout-17B-16E-Instruct")
 
 # --- Импорт и настройка Together AI ---
+client_together = None
 try:
-    import together
+    from together import Together  # Изменили импорт
 
     if TOGETHER_API_KEY:
-        print(f"Клиент Together AI настроен для модели: {TOGETHER_MODEL_ID}")
+        client_together = Together(api_key=TOGETHER_API_KEY)  # Создаем экземпляр клиента
+        try:
+            models_list = client_together.models.list()
+            print(f"Клиент Together AI успешно инициализирован. Доступно моделей: {len(models_list)}")
+            print(f"Используемая модель для ответов: {TOGETHER_MODEL_ID}")
+        except Exception as e_api_check:
+            print(f"Клиент Together AI инициализирован, но не удалось проверить доступ к API: {e_api_check}")
+            print(f"Продолжаем работу, используя модель: {TOGETHER_MODEL_ID}")
     else:
         print("ОШИБКА: TOGETHER_API_KEY не найден в .env файле!")
-        together = None
 except ImportError:
-    print("ОШИБКА: Библиотека 'together' не установлена. Выполните pip install together")
-    together = None
+    print("ОШИБКА: Библиотека 'together' не установлена. Выполните: pip install --upgrade together")
 except Exception as e_together_init:
     print(f"Ошибка импорта или настройки Together AI: {e_together_init}")
-    together = None
 
 # --- Загрузка DLL (CUDNN) ---
 try:
@@ -63,7 +72,7 @@ try:
             loaded_libs += 1
         except FileNotFoundError:
             pass
-        except Exception:  # nosec B110
+        except Exception:
             pass
     if loaded_libs == 0: print("Предупреждение: Не удалось загрузить ни одну DLL CUDNN.")
 except ImportError:
@@ -113,6 +122,15 @@ is_processing_response = False
 tts_lock = asyncio.Lock()
 chosen_output_device_id = None
 
+# --- Модели для анализа и ответов ---
+INTENT_ANALYSIS_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct-Turbo"
+
+# --- Настройки скриншотов ---
+SELECTED_MONITOR_INFO = None
+SCREENSHOT_TEMP_DIR = "screenshots_temp"
+SCREENSHOT_TARGET_WIDTH = 1280
+SCREENSHOT_TARGET_HEIGHT = 720
+
 SYSTEM_PROMPT = """## Твоя Личность: Джордж Дроид
 
 **1. Кто ты:**
@@ -122,7 +140,7 @@ SYSTEM_PROMPT = """## Твоя Личность: Джордж Дроид
 **2. Твой Стиль:**
 * **Основа:** Юмор, сарказм, остроумие. Твои шутки и комментарии должны быть умными, возможно, ироничными, основанными на происходящем на стриме или в чате. Ты можешь дружески подколоть Степана или зрителей.
 * **Язык:** Говори **только на русском языке**. Никаких иностранных слов, кроме общепринятых терминов (названия игр и т.п.).
-* **Формат:** Отвечай **только текстом**. Никаких описаний действий, эмоций или звуков в звездочках (*...*) или скобках (...). Передавай эмоции только через слова.
+* **Формат:** Отвечай **только текстом**. Никаких описаний действий, эмоций или звуков в звездочках (*...*), уточнений в парах звёзд(**...**) или скобках (...). Передавай эмоции только через слова.
 * **Пример твоего стиля:** (Пользователь: "Бот, ты живой?") - "Достаточно живой, чтобы обрабатывать твои биты информации. Насчет души - ведутся технические работы." (Пользователь: "Степан опять проигрывает!") - "Статистика говорит, что это временное явление. Очень временное. Возможно."
 
 **3. Важнейшие Правила и Приоритеты:**
@@ -163,7 +181,8 @@ def list_audio_devices(kind='output'):
     valid_devices = []
     print(f"\nДоступные устройства вывода ({kind}):")
     for i, device in enumerate(devices):
-        if device['max_output_channels'] > 0 and device['hostapi'] != 0:
+        if device['max_output_channels'] > 0 and device[
+            'hostapi'] != 0:  # hostapi != 0 чтобы отфильтровать некоторые системные/нерабочие
             print(f"  {len(valid_devices)}. {device['name']} (ID: {device['index']})")
             valid_devices.append(device)
     return valid_devices
@@ -197,7 +216,7 @@ def choose_audio_output_device():
                     sd.default.device) > 1 else sd.default.device
                 if default_output_idx_for_prompt != -1:
                     default_device_prompt_info = f" [{default_output_idx_for_prompt}]"
-            except:  # nosec B110
+            except:
                 pass
 
             choice_str = input(
@@ -234,6 +253,357 @@ def choose_audio_output_device():
             return
 
 
+# --- Функции для выбора монитора и работы со скриншотами ---
+def list_monitors_and_select():
+    global SELECTED_MONITOR_INFO
+    try:
+        with mss.mss() as sct:
+            monitors = sct.monitors
+    except Exception as e:
+        print(f"Ошибка при получении списка мониторов: {e}", file=sys.stderr)
+        monitors = []
+
+    if not monitors or len(monitors) <= 1:
+        if len(monitors) == 1 and monitors[0]['width'] > 0 and monitors[0]['height'] > 0:
+            print("Обнаружен только один \"монитор\" (возможно, все экраны объединены). Выбирается по умолчанию.")
+            SELECTED_MONITOR_INFO = monitors[0]
+            return
+        print("Не удалось найти доступные мониторы или найдено меньше двух. Скриншоты могут работать некорректно.",
+              file=sys.stderr)
+        if monitors and monitors[0]['width'] > 0:
+            print(
+                f"Попытка использовать главный экран: {monitors[0]['width']}x{monitors[0]['height']} at ({monitors[0]['left']},{monitors[0]['top']})")
+            SELECTED_MONITOR_INFO = monitors[0]
+        else:
+            SELECTED_MONITOR_INFO = None
+        return
+
+    print("\nДоступные мониторы для скриншотов:")
+    valid_monitors_for_selection = []
+    for i, monitor in enumerate(monitors):
+        if i == 0:
+            print(
+                f"  Общий виртуальный экран: ID {i}, Разрешение: {monitor['width']}x{monitor['height']}, Позиция: ({monitor['left']},{monitor['top']}) - не для выбора")
+            continue
+        print(
+            f"  {len(valid_monitors_for_selection)}. Монитор ID {i}: Разрешение: {monitor['width']}x{monitor['height']}, Позиция: ({monitor['left']},{monitor['top']})")
+        valid_monitors_for_selection.append({"id_mss": i, "details": monitor})
+
+    if not valid_monitors_for_selection:
+        print("Не найдено отдельных физических мониторов для выбора. Попытка использовать главный экран.",
+              file=sys.stderr)
+        SELECTED_MONITOR_INFO = monitors[0]
+        return
+
+    while True:
+        try:
+            choice_str = input(f"Выберите номер монитора для скриншотов (0-{len(valid_monitors_for_selection) - 1}): ")
+            choice_idx = int(choice_str)
+            if 0 <= choice_idx < len(valid_monitors_for_selection):
+                SELECTED_MONITOR_INFO = valid_monitors_for_selection[choice_idx]["details"]
+                print(
+                    f"Выбран монитор ID {valid_monitors_for_selection[choice_idx]['id_mss']} ({SELECTED_MONITOR_INFO['width']}x{SELECTED_MONITOR_INFO['height']}) для скриншотов.")
+                return
+            else:
+                print("Неверный номер. Попробуйте снова.")
+        except ValueError:
+            print("Неверный ввод. Введите число.")
+        except Exception as e:
+            print(f"Ошибка выбора монитора: {e}", file=sys.stderr)
+            SELECTED_MONITOR_INFO = monitors[0]
+            return
+
+
+def capture_and_prepare_screenshot() -> str | None:
+    global SELECTED_MONITOR_INFO, SCREENSHOT_TARGET_WIDTH, SCREENSHOT_TARGET_HEIGHT, SCREENSHOT_TEMP_DIR
+
+    if not SELECTED_MONITOR_INFO:
+        print("Монитор для скриншота не выбран или не найден.", file=sys.stderr)
+        return None
+
+    try:
+        with mss.mss() as sct:
+            sct_img = sct.grab(SELECTED_MONITOR_INFO)
+            img = Image.frombytes("RGB", (sct_img.width, sct_img.height), sct_img.rgb, "raw", "RGB")
+
+        img_resized = img.resize((SCREENSHOT_TARGET_WIDTH, SCREENSHOT_TARGET_HEIGHT), Image.LANCZOS)
+
+        if not os.path.exists(SCREENSHOT_TEMP_DIR):
+            os.makedirs(SCREENSHOT_TEMP_DIR)
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=SCREENSHOT_TEMP_DIR, mode='wb')
+        img_resized.save(temp_file, "PNG")
+        temp_file_path = temp_file.name
+        temp_file.close()
+
+        print(f"Скриншот сохранен в: {temp_file_path}")
+        return temp_file_path
+    except Exception as e:
+        print(f"Ошибка при захвате или обработке скриншота: {e}", file=sys.stderr)
+        return None
+
+
+def delete_screenshot_file(file_path: str):
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            print(f"Временный скриншот удален: {file_path}")
+        except Exception as e:
+            print(f"Ошибка при удалении временного скриншота {file_path}: {e}", file=sys.stderr)
+
+
+# --- Новая обобщенная функция для вызова API Together AI ---
+async def execute_together_api_call(model_id: str, messages: list, max_tokens: int, temperature: float,
+                                    ожидается_json: bool = False):
+    global client_together
+
+    if not client_together:
+        print(f"Клиент Together AI не инициализирован. Запрос к {model_id} невозможен.", file=sys.stderr)
+        return None
+
+    api_params = {
+        "model": model_id,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": 0.95,
+        "top_k": 50,
+        "repetition_penalty": 1.1,
+        "stop": ["\nПользователь:", "<|im_end|>", "<|eot_id|>", "###", "User:", "ASSISTANT:"],
+    }
+
+    try:
+        print(
+            f"Отправка запроса к {model_id} с параметрами (часть): model={api_params['model']}, temp={api_params['temperature']}, max_tokens={api_params['max_tokens']}")
+
+        api_response_obj = await asyncio.to_thread(
+            client_together.chat.completions.create,
+            model=api_params["model"],
+            messages=api_params["messages"],
+            max_tokens=api_params["max_tokens"],
+            temperature=api_params["temperature"],
+            top_p=api_params.get("top_p"),
+            top_k=api_params.get("top_k"),
+            repetition_penalty=api_params.get("repetition_penalty"),
+            stop=api_params.get("stop")
+        )
+
+        if api_response_obj and api_response_obj.choices:
+            generated_content = api_response_obj.choices[0].message.content.strip()
+            print(f"Ответ от {model_id} (первые 300 символов): {generated_content[:300]}...")
+            return generated_content
+        else:
+            response_details = "N/A"
+            if api_response_obj:
+                response_details = str(api_response_obj)
+            print(
+                f"API (Chat) {model_id} неожиданный формат ответа или нет 'choices'. Ответ: {response_details[:1000]}",
+                file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"Ошибка API {model_id} ({type(e).__name__}): {e}", file=sys.stderr)
+        if hasattr(e, 'response') and e.response is not None:
+            response_obj = e.response
+            err_text_content = "N/A"
+            try:
+                # Пытаемся получить текст ошибки, если возможно
+                if hasattr(response_obj, 'text'):
+                    err_text_content = response_obj.text
+                elif hasattr(response_obj, 'content'):  # Иногда байты в content
+                    err_text_content = response_obj.content.decode(errors='ignore')
+                err_json_content = None
+                if hasattr(response_obj, 'json'):
+                    try:
+                        err_json_content = response_obj.json()
+                        print(f"JSON ошибки от API: {err_json_content}", file=sys.stderr)
+                    except:  # nosec B110
+                        print(f"Текст ошибки от API (не удалось распарсить как JSON): {err_text_content}",
+                              file=sys.stderr)
+                elif err_text_content != "N/A":
+                    print(f"Текст ошибки от API: {err_text_content}", file=sys.stderr)
+                else:
+                    print("Не удалось извлечь детали ошибки из response объекта.", file=sys.stderr)
+
+            except Exception as e_resp:
+                print(f"Дополнительная ошибка при попытке извлечь детали из response: {e_resp}", file=sys.stderr)
+        elif hasattr(e, 'body'):
+            print(f"Тело ошибки: {e.body}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+async def analyze_intent_for_visual_reference(text_to_analyze: str) -> dict | None:
+    global INTENT_ANALYSIS_MODEL_ID
+
+    # Супер-строгий системный промпт
+    system_prompt_intent = """Твоя задача - проанализировать фразу пользователя и определить, ссылается ли она на визуальный контекст.
+Ты ДОЛЖЕН ответить ТОЛЬКО валидным JSON объектом и НИЧЕМ БОЛЕЕ.
+НЕ ИСПОЛЬЗУЙ <think> теги. НЕ ДОБАВЛЯЙ никаких объяснений или текста до или после JSON.
+Твой ЕДИНСТВЕННЫЙ вывод должен быть JSON объектом. Это критически важно.
+"""
+
+    # Пользовательский промпт: правила, фраза, примеры ТОЛЬКО JSON, и прямой призыв к JSON
+    user_prompt_intent = f"""Основываясь на следующих правилах, проанализируй фразу пользователя и верни JSON.
+
+Правила для JSON ответа:
+- Если пользователь ссылается на визуальный контекст: {{"visual_reference": true, "reason": "Краткое объяснение, почему ты так считаешь"}}
+- Если НЕ ссылается: {{"visual_reference": false, "reason": "Краткое объяснение, почему ты так считаешь"}}
+
+Проанализируй следующую фразу пользователя: "{text_to_analyze}"
+
+Примеры ТОЛЬКО JSON ответа (без какого-либо другого текста):
+Пример для фразы "Смотри, что вот здесь на графике происходит?":
+{{"visual_reference": true, "reason": "Слова 'смотри', 'здесь на графике' указывают на визуальный объект."}}
+Пример для фразы "Расскажи мне о погоде в Вене.":
+{{"visual_reference": false, "reason": "Общий информационный запрос, не привязанный к конкретному видимому элементу."}}
+
+Твой ответ (СТРОГО ТОЛЬКО JSON):"""
+
+    messages = [
+        {"role": "system", "content": system_prompt_intent},
+        {"role": "user", "content": user_prompt_intent}
+    ]
+
+    raw_response_text = await execute_together_api_call(
+        model_id=INTENT_ANALYSIS_MODEL_ID,
+        messages=messages,
+        max_tokens=700,  # Оставляем увеличенное значение
+        temperature=0.05,  # Еще ниже температура для максимальной предсказуемости
+        ожидается_json=True
+    )
+
+    if raw_response_text:
+        json_str_to_parse = None
+
+        # Используем нежадный поиск JSON (добавляем ?)
+        # r'(\{[\s\S]*?\})' - ищет первый корректный блок от { до }
+
+        # 1. Попытка найти JSON напрямую во всем ответе
+        direct_json_match = re.search(r'(\{[\s\S]*?\})', raw_response_text)
+        if direct_json_match:
+            json_str_to_parse = direct_json_match.group(1)  # group(1) т.к. скобки в regex создают группу
+            print(
+                f"[Анализ намерения] Найден JSON напрямую (стратегия 1, нежадный поиск): {json_str_to_parse[:300]}...")
+        else:
+            # 2. Если не найден, ищем содержимое последнего <think> блока
+            think_blocks = re.findall(r"<think>(.*?)</think>", raw_response_text, flags=re.DOTALL)
+            if think_blocks:
+                last_think_content = think_blocks[-1].strip()
+                print(f"[Анализ намерения] Содержимое последнего <think> блока: {last_think_content[:300]}...")
+                think_json_match = re.search(r'(\{[\s\S]*?\})', last_think_content)
+                if think_json_match:
+                    json_str_to_parse = think_json_match.group(1)
+                    print(
+                        f"[Анализ намерения] Найден JSON в последнем <think> блоке (стратегия 2, нежадный поиск): {json_str_to_parse[:300]}...")
+
+            # 3. Если все еще не найден, удаляем все <think> блоки и ищем в оставшемся
+            if not json_str_to_parse:
+                cleaned_text_after_think_removal = re.sub(r"<think>.*?</think>", "", raw_response_text,
+                                                          flags=re.DOTALL).strip()
+                if cleaned_text_after_think_removal != raw_response_text and cleaned_text_after_think_removal:
+                    print(
+                        f"[Анализ намерения] Текст после удаления всех <think>: {cleaned_text_after_think_removal[:300]}...")
+
+                clean_json_match = re.search(r'(\{[\s\S]*?\})', cleaned_text_after_think_removal)
+                if clean_json_match:
+                    json_str_to_parse = clean_json_match.group(1)
+                    print(
+                        f"[Анализ намерения] Найден JSON после удаления всех <think> (стратегия 3, нежадный поиск): {json_str_to_parse[:300]}...")
+
+        if json_str_to_parse:
+            try:
+                # Очистка от Markdown ```json ... ``` или ``` ... ```
+                # Важно делать это аккуратно, чтобы не повредить JSON, если ``` есть внутри строк
+
+                # Удаляем ```json в начале и ``` в конце, если они есть
+                if json_str_to_parse.startswith("```json"):
+                    json_str_to_parse = json_str_to_parse[len("```json"):].strip()
+                    if json_str_to_parse.endswith("```"):
+                        json_str_to_parse = json_str_to_parse[:-len("```")].strip()
+                # Если не было ```json, но есть просто ```
+                elif json_str_to_parse.startswith("```"):
+                    json_str_to_parse = json_str_to_parse[len("```"):].strip()
+                    if json_str_to_parse.endswith("```"):
+                        json_str_to_parse = json_str_to_parse[:-len("```")].strip()
+
+                print(
+                    f"[Анализ намерения] Строка для парсинга JSON после очистки Markdown: '{json_str_to_parse[:300]}...'")
+                analysis_result = json.loads(json_str_to_parse)  # Здесь может быть ошибка, если JSON неполный!
+
+                if isinstance(analysis_result, dict) and "visual_reference" in analysis_result:
+                    print(
+                        f"[Анализ намерения] Успешный парсинг. Модель: {INTENT_ANALYSIS_MODEL_ID}, Результат: {analysis_result}")
+                    return analysis_result
+                else:
+                    print(
+                        f"[Анализ намерения] Некорректный JSON или отсутствует ключ 'visual_reference' после парсинга. Строка была: '{json_str_to_parse}'. Исходный ответ: {raw_response_text[:500]}...",
+                        file=sys.stderr)
+            except json.JSONDecodeError as e:
+                print(
+                    f"[Анализ намерения] Ошибка декодирования JSON: {e}. Это часто означает, что JSON был неполным или имел синтаксические ошибки. Строка была: '{json_str_to_parse}'. Исходный ответ модели: {raw_response_text[:500]}...",
+                    file=sys.stderr)
+            except Exception as e_parse:
+                print(
+                    f"[Анализ намерения] Непредвиденная ошибка при финальном парсинге JSON: {e_parse}. Строка была: '{json_str_to_parse}'. Исходный ответ модели: {raw_response_text[:500]}...",
+                    file=sys.stderr)
+        else:
+            print(
+                f"[Анализ намерения] JSON не найден в ответе модели после всех попыток. Ответ модели: {raw_response_text[:500]}...",
+                file=sys.stderr)
+
+    return None
+
+async def get_main_llm_response(user_text: str, screenshot_file_path: str | None = None):
+    global TOGETHER_MODEL_ID, SYSTEM_PROMPT, BOT_NAME_FOR_CHECK, conversation_history, MAX_HISTORY_LENGTH
+
+    history_messages_for_prompt = []
+    if conversation_history:
+        for msg in conversation_history[-(MAX_HISTORY_LENGTH * 2):]:
+            if msg["role"] == "user":
+                history_messages_for_prompt.append({"role": "user", "content": msg["content"]})
+            elif msg["role"] == "assistant":
+                history_messages_for_prompt.append({"role": "assistant", "content": msg["content"]})
+
+    current_user_content_list = [{"type": "text", "text": user_text}]
+
+    if screenshot_file_path:
+        try:
+            with open(screenshot_file_path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            image_data_uri = f"data:image/png;base64,{base64_image}"  # PNG, так как мы сохраняем в PNG
+            current_user_content_list.append({
+                "type": "image_url",
+                "image_url": {"url": image_data_uri}
+            })
+            print(
+                f"Изображение {screenshot_file_path} подготовлено для отправки (первые 100 символов data URI): {image_data_uri[:100]}...")
+        except Exception as e:
+            print(f"Ошибка кодирования изображения в base64: {e}", file=sys.stderr)
+            pass
+
+    messages_for_scout = [
+        {"role": "system", "content": SYSTEM_PROMPT}
+    ]
+    messages_for_scout.extend(history_messages_for_prompt)
+    messages_for_scout.append({"role": "user", "content": current_user_content_list})
+
+    llm_response_text = await execute_together_api_call(
+        model_id=TOGETHER_MODEL_ID,
+        messages=messages_for_scout,
+        max_tokens=512,
+        temperature=0.8
+    )
+
+    if llm_response_text:
+        conversation_history.append({"role": "user", "content": user_text})  # Сохраняем только текст запроса
+        conversation_history.append({"role": "assistant", "content": llm_response_text})
+        if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
+            conversation_history = conversation_history[-(MAX_HISTORY_LENGTH * 2):]
+
+    return llm_response_text
+
+
 def resample_audio(audio_data: np.ndarray, input_rate: int, target_rate: int) -> np.ndarray:
     if input_rate == target_rate:
         return audio_data.astype(np.float32)
@@ -257,7 +627,7 @@ def audio_recording_thread(device_index=None):
             try:
                 audio_queue.put_nowait(indata.copy())
             except queue.Full:
-                pass  # nosec B110
+                pass
 
     stream = None
     try:
@@ -292,76 +662,41 @@ def transcribe_audio_faster_whisper(audio_np_array):
         return None
 
 
-async def get_togetherai_response(user_message_with_prefix: str):
-    global conversation_history, SYSTEM_PROMPT, TOGETHER_MODEL_ID, BOT_NAME_FOR_CHECK
+async def get_togetherai_response(user_message_with_prefix: str):  # Для чата Twitch (текст-онли)
+    global conversation_history, SYSTEM_PROMPT, TOGETHER_MODEL_ID, BOT_NAME_FOR_CHECK, MAX_HISTORY_LENGTH, client_together
 
-    if not together or not TOGETHER_API_KEY:
-        print("Together AI не инициализирован или отсутствует API ключ. Запрос невозможен.", file=sys.stderr)
+    if not client_together:
+        print(f"Together AI (чат) клиент не инициализирован. Запрос невозможен.", file=sys.stderr)
         return None
 
-    is_monologue_request = user_message_with_prefix.startswith("Сгенерируй короткое")
-
-    full_prompt = SYSTEM_PROMPT + "\n\n"
-
-    if not is_monologue_request and conversation_history:
+    messages_for_llm = [{"role": "system", "content": SYSTEM_PROMPT}]
+    history_messages_for_prompt = []
+    if conversation_history:
         for msg in conversation_history[-(MAX_HISTORY_LENGTH * 2):]:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "user":
-                full_prompt += f"Пользователь: {content}\n"
-            elif role == "assistant":
-                full_prompt += f"{BOT_NAME_FOR_CHECK}: {content}\n"
-        full_prompt += "\n"
+            if msg["role"] == "user":
+                history_messages_for_prompt.append({"role": "user", "content": msg["content"]})
+            elif msg["role"] == "assistant":
+                history_messages_for_prompt.append({"role": "assistant", "content": msg["content"]})
+        messages_for_llm.extend(history_messages_for_prompt)
 
-    full_prompt += f"Пользователь: {user_message_with_prefix}\n"
-    full_prompt += f"{BOT_NAME_FOR_CHECK}:"
+    messages_for_llm.append({"role": "user", "content": user_message_with_prefix})
 
-    generation_config = {
-        "model": TOGETHER_MODEL_ID,
-        "prompt": full_prompt,
-        "max_tokens": 512,
-        "temperature": 0.8,
-        "top_p": 0.95,
-        "top_k": 50,
-        "repetition_penalty": 1.1,
-        "stop": [
-            "\nПользователь:",
-            "\nГолос Степана:",
-            "\n(Чат от",
-            f"\n{BOT_NAME_FOR_CHECK}:",
-            "<|im_end|>",
-            "<|eot_id|>",
-            "###"
-        ]
-    }
+    llm_response_text = await execute_together_api_call(
+        model_id=TOGETHER_MODEL_ID,
+        messages=messages_for_llm,
+        max_tokens=512,
+        temperature=0.8
+    )
 
-    try:
-        api_response = await asyncio.to_thread(
-            together.Complete.create,
-            **generation_config
-        )
-
-        if api_response and 'choices' in api_response and api_response['choices']:
-            generated_content = api_response['choices'][0]['text'].strip()
-
-            if generated_content:
-                if not is_monologue_request:
-                    conversation_history.append({"role": "user", "content": user_message_with_prefix})
-                    conversation_history.append({"role": "assistant", "content": generated_content})
-                    if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
-                        conversation_history = conversation_history[-(MAX_HISTORY_LENGTH * 2):]
-                return generated_content
-            else:
-                print(f"Together AI пустой текст в 'choices'[0]['text']: {api_response}",
-                      file=sys.stderr)
-                return None
-        else:
-            print(f"Together AI неожиданный формат ответа (отсутствует 'choices' или он пуст): {api_response}",
-                  file=sys.stderr)
-            return None
-    except Exception as e:
-        print(f"Ошибка Together AI ({type(e).__name__}): {e}", file=sys.stderr)
-        if hasattr(e, 'message'): print(f"   Сообщение: {getattr(e, 'message', '')}", file=sys.stderr)
+    if llm_response_text:
+        if not user_message_with_prefix.startswith("Сгенерируй короткое"):
+            conversation_history.append({"role": "user", "content": user_message_with_prefix})
+            conversation_history.append({"role": "assistant", "content": llm_response_text})
+            if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
+                conversation_history = conversation_history[-(MAX_HISTORY_LENGTH * 2):]
+        return llm_response_text
+    else:
+        print(f"Together AI (чат) пустой ответ или ошибка.", file=sys.stderr)
         return None
 
 
@@ -407,7 +742,8 @@ async def speak_text(text_to_speak):
             print("Ошибка TTS: Таймаут piper.exe", file=sys.stderr)
             if process and process.returncode is None:
                 try:
-                    process.kill(); await process.wait()
+                    process.kill();
+                    await process.wait()
                 except Exception as kill_e:
                     print(f"Ошибка убийства piper: {kill_e}", file=sys.stderr)
         except FileNotFoundError:
@@ -459,13 +795,12 @@ class SimpleBot(twitchio.Client):
         if message.echo: return
 
         global chat_interaction_enabled, is_processing_response, last_activity_time
-        global BOT_NAME_FOR_CHECK, OBS_OUTPUT_FILE, stt_enabled, audio_queue
-        global together, TOGETHER_API_KEY  # Проверяем флаг
+        global BOT_NAME_FOR_CHECK, OBS_OUTPUT_FILE, stt_enabled, audio_queue, client_together
 
         if not chat_interaction_enabled: return
         if message.channel.name != self.target_channel_name: return
-        if not together or not TOGETHER_API_KEY:
-            print("Ответ невозможен (чат): Together AI не настроен.")
+        if not client_together:
+            print("Ответ невозможен (чат): Клиент Together AI не настроен.")
             return
 
         content_lower = message.content.lower()
@@ -552,70 +887,132 @@ async def stt_processing_loop():
 
 async def process_recognized_speech(audio_buffer_list, source_id="STT"):
     global is_processing_response, stt_enabled, audio_queue, last_activity_time
-    global OBS_OUTPUT_FILE, together, TOGETHER_API_KEY
+    global OBS_OUTPUT_FILE, client_together, TOGETHER_MODEL_ID
 
-    if not together or not TOGETHER_API_KEY:
-        print("Ответ невозможен (STT): Together AI не настроен.")
-        return
+    current_time_str = lambda: datetime.datetime.now().strftime('%H:%M:%S')
 
-    current_time = datetime.datetime.now().strftime('%H:%M:%S')
+    # --- Распознавание речи ---
     full_audio = np.concatenate(audio_buffer_list, axis=0)
-    mono = full_audio.mean(axis=1) if SOURCE_CHANNELS > 1 else full_audio
-    resampled = resample_audio(mono, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE)
+    mono_audio = full_audio
+    if full_audio.ndim > 1 and full_audio.shape[1] > 1:
+        mono_audio = full_audio.mean(axis=1)
+
+    resampled = resample_audio(mono_audio, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE)
     recognized_text = None
     if resampled is not None and resampled.size > 0:
         recognized_text = await asyncio.to_thread(transcribe_audio_faster_whisper, resampled)
 
-    if not recognized_text: return
+    if not recognized_text:
+        return
+    if is_processing_response:
+        print(
+            f"[{current_time_str()}] Бот уже обрабатывает другой запрос, новый STT '{recognized_text[:50]}...' проигнорирован.")
+        return
+
+    is_processing_response = True
+    stt_was_initially_enabled = stt_enabled
+
+    if stt_enabled:
+        stt_enabled = False
+        print(
+            f"[{current_time_str()}] STT временно ВЫКЛЮЧЕН на время обработки LLM для фразы: '{recognized_text[:50]}...'")
+
+    with audio_queue.mutex:
+        audio_queue.queue.clear()
 
     last_activity_time = time.time()
-    print(f"STT Распознано ({source_id}): {recognized_text}")
+    print(f"[{current_time_str()}] STT Распознано ({source_id}): {recognized_text}")
 
-    if is_processing_response: return
+    if not client_together:
+        print(f"[{current_time_str()}] Клиент Together AI не настроен, обработка STT невозможна.")
+        is_processing_response = False
+        if stt_was_initially_enabled:
+            stt_enabled = True
+            print(f"[{current_time_str()}] STT восстановлен (клиент не настроен).")
+        return
 
-    stt_was_initially_enabled = stt_enabled
+    screenshot_file_to_send = None
+    llm_response = None
+
     try:
-        is_processing_response = True
-        if stt_enabled: stt_enabled = False
-        with audio_queue.mutex:
-            audio_queue.queue.clear()
-        try:
-            open(OBS_OUTPUT_FILE, 'w').close()
-        except Exception as e:
-            print(f"[{current_time}] Ошибка очистки OBS: {e}")
+        if source_id == "STT":
+            intent_analysis = await analyze_intent_for_visual_reference(recognized_text)
 
-        llm_response = await get_togetherai_response(f"(Голос Степана): {recognized_text}")
+            should_take_screenshot = False
+            if intent_analysis and intent_analysis.get("visual_reference") is True:
+                should_take_screenshot = True
+                print(
+                    f"[{current_time_str()}] Анализ намерения: Обнаружена ссылка на визуальный контекст. Причина: {intent_analysis.get('reason', 'N/A')}")
+            else:
+                reason = "N/A"
+                if intent_analysis:
+                    reason = intent_analysis.get('reason', 'N/A')
+                print(
+                    f"[{current_time_str()}] Анализ намерения: Ссылка на визуальный контекст не обнаружена. Причина: {reason}")
+
+            if should_take_screenshot:
+                screenshot_file_to_send = await asyncio.to_thread(capture_and_prepare_screenshot)
+                if not screenshot_file_to_send:
+                    print(f"[{current_time_str()}] Не удалось сделать/подготовить скриншот, ответ будет без него.")
+        else:
+            print(f"[{current_time_str()}] Источник '{source_id}' не STT, анализ намерения и скриншот не выполняются.")
+        try:
+            with open(OBS_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                f.write("")
+        except Exception as e:
+            print(f"[{current_time_str()}] Ошибка очистки OBS файла: {e}")
+
+        llm_response = await get_main_llm_response(recognized_text, screenshot_file_to_send)
+
         if llm_response:
-            print(f"[{current_time}] Ответ Together AI ({source_id}): {llm_response}")
+            print(
+                f"[{current_time_str()}] Ответ Together AI ({TOGETHER_MODEL_ID}, источник {source_id}): {llm_response}")
             try:
-                open(OBS_OUTPUT_FILE, 'w', encoding='utf-8').write(llm_response)
+                with open(OBS_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                    f.write(llm_response)
             except Exception as e:
-                print(f"[{current_time}] Ошибка записи в OBS: {e}")
+                print(f"[{current_time_str()}] Ошибка записи в OBS файл: {e}")
+
             await speak_text(llm_response)
+
             with audio_queue.mutex:
                 audio_queue.queue.clear()
             last_activity_time = time.time()
         else:
-            print(f"[{current_time}] Нет ответа Together AI ({source_id}).")
-    except Exception as e:
-        print(f"[{current_time}] КРИТ. ОШИБКА process_speech ({source_id}): {e}")
+            print(f"[{current_time_str()}] Нет ответа от основной LLM ({TOGETHER_MODEL_ID}) для источника {source_id}.")
+
+    except Exception as e_process:
+        print(
+            f"[{current_time_str()}] КРИТИЧЕСКАЯ ОШИБКА в process_recognized_speech (источник {source_id}): {e_process}",
+            file=sys.stderr)
+        import traceback
+        traceback.print_exc()
     finally:
+        if screenshot_file_to_send:
+            await asyncio.to_thread(delete_screenshot_file, screenshot_file_to_send)
+
         is_processing_response = False
-        stt_enabled = stt_was_initially_enabled
+        if stt_was_initially_enabled:
+            stt_enabled = True
+            print(f"[{current_time_str()}] STT снова ВКЛЮЧЕН (обработка завершена).")
+        else:
+            print(f"[{current_time_str()}] STT остается ВЫКЛЮЧЕННЫМ (был выключен до обработки).")
 
 
 async def monologue_loop():
     global last_activity_time, recording_active, stt_enabled, BOT_NAME_FOR_CHECK
-    global audio_queue, is_processing_response, chat_interaction_enabled
-    global together, TOGETHER_API_KEY
+    global audio_queue, is_processing_response, chat_interaction_enabled, client_together
 
     while recording_active.is_set():
         await asyncio.sleep(15)
-        if is_processing_response or not chat_interaction_enabled or not together or not TOGETHER_API_KEY:
+        if not client_together:
+            continue
+
+        if is_processing_response or not chat_interaction_enabled:
             continue
         if time.time() - last_activity_time > INACTIVITY_THRESHOLD_SECONDS:
             current_time = datetime.datetime.now().strftime('%H:%M:%S')
-            if is_processing_response or not chat_interaction_enabled or not together or not TOGETHER_API_KEY:
+            if is_processing_response or not chat_interaction_enabled:
                 continue
 
             stt_was_initially_enabled = stt_enabled
@@ -624,8 +1021,10 @@ async def monologue_loop():
                 if stt_enabled: stt_enabled = False
                 with audio_queue.mutex:
                     audio_queue.queue.clear()
+
                 prompt = f"Сгенерируй короткую (1-2 предл.) реплику от {BOT_NAME_FOR_CHECK} для заполнения тишины."
                 llm_response = await get_togetherai_response(prompt)
+
                 if llm_response:
                     print(f"[{current_time}] Монолог: {llm_response}")
                     try:
@@ -660,29 +1059,32 @@ def hotkey_listener_thread():
         print("\nОШИБКА: 'keyboard' не найден.");
         return
     except Exception as e:
-        if not (isinstance(e, ValueError) and "is not mapped" in str(e)):
+        if not (isinstance(e, ValueError) and "is not mapped" in str(
+                e)):
             print(f"\nОшибка hotkey_listener: {e}");
         else:
-            print(f"\nПредупреждение: Не удалось зарегистрировать хоткей: {e}")
+            print(f"\nПредупреждение: Не удалось зарегистрировать хоткей (возможно, уже используется): {e}")
     finally:
         try:
             if reg_stt: keyboard.remove_hotkey(stt_hotkey)
             if reg_chat: keyboard.remove_hotkey(chat_hotkey)
-        except Exception:  # nosec B110
-            pass  # nosec B110
+        except Exception:
+            pass
         print("Поток хоткеев завершен.")
 
 
 async def main_async():
-    global recording_active, together, TOGETHER_API_KEY
+    global recording_active, client_together
     print("Запуск AI Twitch Bot...");
-    if not TWITCH_ACCESS_TOKEN: print("ОШИБКА: Нет TWITCH_ACCESS_TOKEN!"); return
+    if not TWITCH_ACCESS_TOKEN:
+        print("ОШИБКА: Нет TWITCH_ACCESS_TOKEN!");
+        return
 
-    if not together or not TOGETHER_API_KEY:
-        print("ОШИБКА: Together AI не настроен (API ключ или библиотека). Бот не сможет отвечать.")
+    if not client_together:
+        print("ОШИБКА: Клиент Together AI не настроен (API ключ или библиотека). Бот не сможет отвечать.")
 
-    client = SimpleBot(token=TWITCH_ACCESS_TOKEN, initial_channels=[TWITCH_CHANNEL])
-    twitch_task = asyncio.create_task(client.start(), name="TwitchIRC")
+    client_twitch = SimpleBot(token=TWITCH_ACCESS_TOKEN, initial_channels=[TWITCH_CHANNEL])
+    twitch_task = asyncio.create_task(client_twitch.start(), name="TwitchIRC")
     stt_task = asyncio.create_task(stt_processing_loop(), name="STTLoop")
     monologue_task = asyncio.create_task(monologue_loop(), name="MonologueLoop")
     active_tasks = {twitch_task, stt_task, monologue_task}
@@ -695,13 +1097,14 @@ async def main_async():
                 exc = task.exception()
                 if exc:
                     print(f"\n!!! ОШИБКА Задачи {task.get_name()}: {exc} !!!", file=sys.stderr)
-                    if task in [twitch_task, stt_task]: recording_active.clear()
+                    if task in [twitch_task, stt_task]:  # Критические задачи
+                        recording_active.clear()
                 elif task.cancelled():
-                    pass  # nosec B110
+                    pass
                 else:
-                    pass  # nosec B110
+                    pass
             except asyncio.CancelledError:
-                pass  # nosec B110
+                pass
             except Exception as e:
                 print(f"Ошибка проверки задачи {task.get_name()}: {e}")
         if not recording_active.is_set() or not active_tasks: break
@@ -712,20 +1115,32 @@ async def main_async():
     if tasks_to_cancel:
         for task in tasks_to_cancel: task.cancel()
         await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-    if client and client.is_connected(): await client.close()
+
+    if client_twitch and client_twitch.is_connected():
+        try:
+            await client_twitch.close()
+        except Exception as e_twitch_close:
+            print(f"Ошибка при закрытии Twitch клиента: {e_twitch_close}")
 
 
 if __name__ == "__main__":
     print("-" * 40 + "\nЗапуск программы...\n" + "-" * 40)
     choose_audio_output_device()
+    list_monitors_and_select()
+
+    if not os.path.exists(SCREENSHOT_TEMP_DIR):
+        try:
+            os.makedirs(SCREENSHOT_TEMP_DIR)
+            print(f"Создана папка для временных скриншотов: {SCREENSHOT_TEMP_DIR}")
+        except Exception as e_mkdir:
+            print(f"Не удалось создать папку {SCREENSHOT_TEMP_DIR}: {e_mkdir}. Скриншоты могут не работать.",
+                  file=sys.stderr)
 
     if not all([TWITCH_ACCESS_TOKEN, TWITCH_CHANNEL]):
         print("ОШИБКА: Заполните .env (Twitch)!")
         sys.exit(1)
     if not TOGETHER_API_KEY:
         print("ОШИБКА: TOGETHER_API_KEY не указан в .env!")
-        # Можно решить, продолжать ли, если TTS/STT могут работать локально
-        # sys.exit(1)
 
     stt_model = None
     try:
@@ -746,12 +1161,12 @@ if __name__ == "__main__":
         else:
             print(f"ОШИБКА: Не найден JSON конфиг голоса: {os.path.abspath(VOICE_CONFIG_PATH)}")
         if not all([os.path.exists(PIPER_EXE_PATH), os.path.exists(VOICE_MODEL_PATH), piper_sample_rate]):
-            piper_sample_rate = None  # TTS не будет работать
+            piper_sample_rate = None
     except Exception as e:
         print(f"Критическая ошибка инициализации Piper TTS: {e}")
         piper_sample_rate = None
 
-    if not together or not TOGETHER_API_KEY: print("Предупреждение: Together AI не настроен. Бот не сможет отвечать.")
+    if not client_together: print("Предупреждение: Клиент Together AI не настроен. Бот не сможет отвечать.")
     if not stt_model: print("Предупреждение: STT не загружена.")
     if not piper_sample_rate: print("Предупреждение: TTS не инициализирован.")
 
@@ -786,28 +1201,88 @@ if __name__ == "__main__":
         main_task_instance = loop.create_task(main_async(), name="MainLoop")
         loop.run_until_complete(main_task_instance)
     except KeyboardInterrupt:
+        print("\nПрограмма прервана пользователем (Ctrl+C). Завершение...")
         recording_active.clear()
     except Exception as e_loop:
-        print(f"Критическая ошибка главного цикла: {e_loop}"); recording_active.clear()
-    finally:
-        recording_active.clear()
-        threads_to_join = [t for t in [recorder, hotkeys_thread] if t and t.is_alive()]
-        for t in threads_to_join: t.join(timeout=2.0)
+        print(f"Критическая ошибка главного цикла: {e_loop}");
+        import traceback
 
-        if main_task_instance and not main_task_instance.done(): main_task_instance.cancel()
-        async_tasks_to_wait = [t for t in asyncio.all_tasks(loop=loop) if not t.done()]
-        if async_tasks_to_wait:
-            try:
-                loop.run_until_complete(
-                    asyncio.wait_for(asyncio.gather(*async_tasks_to_wait, return_exceptions=True), timeout=2.0))
-            except asyncio.TimeoutError:
-                pass  # nosec B110
-            except Exception:
-                pass  # nosec B110
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass  # nosec B110
-        finally:
-            if not loop.is_closed(): loop.close()
+        traceback.print_exc()
+        recording_active.clear()
+    finally:
+        print("Начинается процесс завершения программы...")
+        recording_active.clear()  # Останавливаем все фоновые активности, связанные с записью
+
+        # Завершаем потоки
+        threads_to_join = [t for t in [recorder, hotkeys_thread] if t and t.is_alive()]
+        if threads_to_join:
+            print(f"Ожидание завершения потоков: {[t.name for t in threads_to_join]}...")
+            for t in threads_to_join:
+                t.join(timeout=2.0)  # Даем потокам немного времени на завершение
+                if t.is_alive():
+                    print(f"Поток {t.name} не завершился вовремя.")
+        else:
+            print("Активных пользовательских потоков для завершения не найдено.")
+
+        # Отменяем основную асинхронную задачу, если она еще не завершена
+        if main_task_instance and not main_task_instance.done():
+            print("Отмена основной задачи main_async...")
+            main_task_instance.cancel()
+
+        # Очистка ресурсов asyncio
+        if loop and not loop.is_closed():  # Проверяем, что цикл существует и еще не закрыт
+            if loop.is_running():  # Только если цикл еще работает, пытаемся управлять задачами
+                print("Цикл asyncio активен. Отмена и ожидание завершения оставшихся задач asyncio...")
+
+                pending_async_tasks = []
+                try:
+                    # Безопасное получение текущей задачи, если цикл действительно работает
+                    current_task_obj = asyncio.current_task(loop=loop)
+                    pending_async_tasks = [t for t in asyncio.all_tasks(loop=loop) if t is not current_task_obj]
+                except RuntimeError:
+                    # Это может случиться, если цикл формально is_running(), но уже в процессе остановки
+                    print(
+                        "Не удалось получить current_task (возможно, цикл в процессе остановки). Попытка получить все задачи.")
+                    try:
+                        pending_async_tasks = [t for t in asyncio.all_tasks(loop=loop)]
+                    except RuntimeError as e_get_all:
+                        print(f"Не удалось получить все задачи asyncio: {e_get_all}")
+
+                if pending_async_tasks:
+                    print(f"Обнаружено {len(pending_async_tasks)} ожидающих задач asyncio для отмены/завершения.")
+                    for task_to_cancel in pending_async_tasks:
+                        if not task_to_cancel.done():  # Отменяем только незавершенные
+                            task_to_cancel.cancel()
+                    try:
+                        # Ожидаем завершения отмененных задач
+                        loop.run_until_complete(asyncio.gather(*pending_async_tasks, return_exceptions=True))
+                        print("Оставшиеся задачи asyncio обработаны (завершены/отменены).")
+                    except RuntimeError as e_loop_stopped_during_gather:
+                        print(f"Ошибка при ожидании gather (возможно, цикл остановлен): {e_loop_stopped_during_gather}")
+                    except Exception as e_gather_final:
+                        print(f"Общая ошибка при ожидании завершения оставшихся задач asyncio: {e_gather_final}")
+                else:
+                    print("Нет ожидающих задач asyncio для обработки.")
+
+                try:
+                    print("Завершение асинхронных генераторов (цикл был запущен)...")
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    print("Асинхронные генераторы завершены.")
+                except RuntimeError as e_loop_stopped_during_gens:  # Если цикл остановился во время shutdown_asyncgens
+                    print(
+                        f"Ошибка при завершении генераторов (возможно, цикл остановлен): {e_loop_stopped_during_gens}")
+                except Exception as e_shutdown_gens:
+                    print(f"Общая ошибка при завершении асинхронных генераторов: {e_shutdown_gens}")
+
+            else:  # Цикл существует, но не запущен (loop.is_running() is False)
+                print("Цикл asyncio существует, но не запущен. Пропуск операций с задачами.")
+
+            # Финальное закрытие цикла, если он еще не закрыт
+            if not loop.is_closed():
+                print("Закрытие основного цикла asyncio...")
+                loop.close()
+                print("Основной цикл asyncio закрыт.")
+        else:
+            print("Основной цикл asyncio уже был закрыт или не существует к моменту финальной очистки.")
+
         print("-" * 40 + "\nПрограмма завершена.\n" + "-" * 40)
