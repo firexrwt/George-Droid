@@ -318,7 +318,7 @@ class MemoryStore:
                         match = True
                         for key, value in filter_dict.items():
                             if retrieved_meta.get(key) != value:
-                                match = False;
+                                match = False
                                 break
                         if match: results.append(retrieved_meta)
                     else:
