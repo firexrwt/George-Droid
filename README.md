@@ -10,15 +10,17 @@
 George-Droid is a multifunctional streaming assistant built in Python. It listens to your voice, responds with humor,
 and interacts with your Twitch chat like a true co-host.  
 Powered by Together AI (with models like Meta's Llama 4 Scout Instruct or any compatible Together AI model), real-time
-speech recognition (Faster-Whisper) and TTS (Piper). Intelligence of the bot scales with the chosen model (by default
-llama-4-scout-17b is used as the main LLM, faster-whisper medium with compute type int8_float16 for STT). Change the
+speech recognition (Faster-Whisper), TTS (Piper), and a **contextual memory system (RAG)**. Intelligence of the bot
+scales with the chosen model (by default
+llama-4-scout-17b is used as the main LLM, faster-whisper medium with compute type int8 for STT). Change the
 voice by swapping `.onnx` and `.onnx.json` files in `voices/` and updating `VOICE_MODEL_PATH` & `VOICE_CONFIG_PATH`.
 
 George-Droid — многофункциональный стриминговый ИИ-компаньон на Python. Он распознаёт речь, остроумно отвечает и
 общается с чатом Twitch.  
 Работает через Together AI (с моделями типа Meta Llama 4 Scout Instruct или любой совместимой моделью), STT через
-Faster-Whisper и озвучка через Piper. Интеллект бота зависит от выбранной модели (по умолчанию llama-4-scout-17b для
-LLM, faster-whisper medium с compute type int8_float16 для STT). Голос можно поменять, заменив файлы `.onnx` и
+Faster-Whisper, озвучка через Piper, и **система контекстной памяти (RAG)**. Интеллект бота зависит от выбранной
+модели (по умолчанию llama-4-scout-17b для
+LLM, faster-whisper medium с compute type int8 для STT). Голос можно поменять, заменив файлы `.onnx` и
 `.onnx.json` в `voices/` и обновив `VOICE_MODEL_PATH` и `VOICE_CONFIG_PATH`.
 
 ---
@@ -31,6 +33,9 @@ LLM, faster-whisper medium с compute type int8_float16 для STT). Голос 
 - 🗣️ Piper TTS • Голосовая озвучка
 - 💬 Twitch chat bot (triggered by name/highlight) • Бот в чате Twitch
 - 🔁 Idle monologues, hotkey toggles • Монологи во время тишины, управление горячими клавишами
+- 🧠 **Contextual Memory (RAG)** powered by Sentence Transformers and FAISS for enhanced recall • **Контекстная Память (
+  RAG)** на базе Sentence Transformers и FAISS для улучшенного вспоминания
+- 📸 **Visual Context** with Screenshots for LLM analysis • **Визуальный Контекст** со скриншотами для анализа LLM
 
 ---
 
@@ -89,6 +94,7 @@ George-Droid/
 ├── .env
 ├── piper_tts_bin/             # Piper TTS binary
 ├── voices/                    # .onnx voice models
+├── data_george_memory         # memory folder
 └── obs_ai_response.txt        # Output text for OBS overlays
 ```
 
@@ -100,6 +106,7 @@ George-Droid/
 - STT: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 - TTS: [Piper TTS](https://github.com/rhasspy/piper)
 - Chat: [twitchio](https://github.com/TwitchIO/TwitchIO)
+- Memory: [FAISS](https://faiss.ai/), [Sentence-Transformers](https://www.sbert.net/)
 
 ---
 
