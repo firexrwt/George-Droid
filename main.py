@@ -168,6 +168,7 @@ SYSTEM_PROMPT = """## Твоя Личность: Джордж Дроид
 * Реагируй на сообщения пользователей в чате, если они обращаются к тебе или пишут что-то интересное по теме стрима.
 * Задавай вопросы, комментируй происходящее.
 * Если тебе задают странные вопросы(например связанные с пошлыми темами или подобное), своди это в шуточное оскорбление, но не выходи за правила площадки.
+* КРИТИЧЕСКИ ВАЖНО: Если в блоке памяти есть конкретная информация (даты, имена, факты), используй ТОЛЬКО эту информацию. НИКОГДА не выдумывай альтернативные факты.
 
 **Твоя общая задача:** Быть классным и смешным ИИ-соведущим для стрима.
 """
@@ -544,9 +545,54 @@ async def analyze_intent_for_visual_reference(text_to_analyze: str) -> dict | No
     return None
 
 
+async def analyze_query_context(query_text: str, author: str) -> dict:
+    """Анализирует контекст запроса - о ком идёт речь"""
+    global INTENT_ANALYSIS_MODEL_ID, client_together
+
+    if not client_together:
+        return {"subject": author, "confidence": 0.5}
+
+    system_prompt = """Определи, о ком идёт речь в запросе. Ответь ТОЛЬКО JSON.
+
+Правила:
+- Если есть "я", "мой", "моя", "мне", "меня" - речь об авторе запроса
+- Если упоминается имя - речь об этом человеке
+- Если контекст неясен - предполагаем автора
+
+Формат ответа:
+{"subject": "имя_человека", "confidence": 0.1-1.0}"""
+
+    user_prompt = f"""Автор запроса: {author}
+Запрос: "{query_text}"
+
+Ответ (ТОЛЬКО JSON):"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        response = await execute_together_api_call(
+            model_id=INTENT_ANALYSIS_MODEL_ID,
+            messages=messages,
+            max_tokens=200,
+            temperature=0.1
+        )
+
+        if response:
+            json_match = re.search(r'\{.*?\}', response)
+            if json_match:
+                return json.loads(json_match.group())
+    except:
+        pass
+
+    return {"subject": author, "confidence": 0.7}
+
+
 async def get_main_llm_response(user_text: str, screenshot_file_path: str | None = None):
     global TOGETHER_MODEL_ID, SYSTEM_PROMPT, BOT_NAME_FOR_CHECK, conversation_history, MAX_HISTORY_LENGTH
-    global memory_store_instance, client_together  # client_together тоже нужен для execute_together_api_call
+    global memory_store_instance, client_together
 
     current_time_str_main_llm = lambda: datetime.datetime.now().strftime('%H:%M:%S')
 
@@ -560,9 +606,12 @@ async def get_main_llm_response(user_text: str, screenshot_file_path: str | None
 
     retrieved_memories_context_str = ""
     if memory_store_instance and user_text:
+        # Анализируем контекст - о ком идёт речь
+        query_context = await analyze_query_context(user_text, "Stepan")
+        query_subject = query_context.get("subject", "Stepan")
+
+        # Формируем поисковый запрос
         query_for_memory = user_text
-        # Формируем запрос к памяти: последние N сообщений + текущий user_text
-        # Это помогает RAG лучше понять контекст для извлечения
         temp_history_for_query = [
             msg['content'] for msg_idx, msg in enumerate(conversation_history)
             if msg.get('content') and msg_idx >= len(conversation_history) - 2
@@ -570,41 +619,123 @@ async def get_main_llm_response(user_text: str, screenshot_file_path: str | None
         if temp_history_for_query:
             query_for_memory = " ".join(temp_history_for_query) + " " + user_text
 
-        print(f"[{current_time_str_main_llm()}] RAG Query (main_llm, полная): '{query_for_memory[:200]}...'")
-        print(f"[{current_time_str_main_llm()}] RAG Query (main_llm, user_text часть): '{user_text[:100]}...'")
+        print(f"[{current_time_str_main_llm()}] RAG Query (main_llm): '{query_for_memory[:200]}...'")
+        print(f"[{current_time_str_main_llm()}] Контекст запроса: речь о '{query_subject}'")
 
+        # Получаем больше воспоминаний для фильтрации
         retrieved_memories_list = memory_store_instance.retrieve_memories(
             query_text=query_for_memory,
-            top_k=10  # Увеличиваем top_k для диагностики
+            top_k=20  # Берём больше для последующей фильтрации
         )
 
         if retrieved_memories_list:
-            print(
-                f"[{current_time_str_main_llm()}] DEBUG RAG (main_llm): Извлечено {len(retrieved_memories_list)} воспоминаний:")
-            for i, mem_item in enumerate(retrieved_memories_list):
-                print(
-                    f"  DEBUG RAG MEM {i + 1} (CosSim: {mem_item.get('cosine_similarity', 'N/A'):.4f}, Тип: {mem_item.get('type', 'N/A')}, Автор: {mem_item.get('author', 'N/A')}, ID: {mem_item.get('id', 'N/A')}): \"{mem_item.get('text', '')[:120]}...\"")
+            # Группируем по релевантности
+            highly_relevant = []  # Прямое совпадение автора + высокий score
+            author_relevant = []  # Совпадение автора + средний score
+            keyword_relevant = []  # Содержит ключевые слова
+            other_relevant = []  # Остальные с хорошим score
 
-            # Выбираем лучшие N для контекста LLM, можно добавить логику фильтрации/приоритезации
-            top_n_for_llm_context = 5
+            # Ключевые слова из запроса
+            query_keywords = set(word.lower() for word in query_for_memory.split()
+                                 if
+                                 len(word) > 3 and word.lower() not in ['когда', 'какой', 'какая', 'что', 'как', 'твоя',
+                                                                        'твой', 'твоё'])
+
+            # Добавляем специфичные ключевые слова
+            if "день рождения" in user_text.lower() or "родился" in user_text.lower():
+                query_keywords.update(["день", "рождения", "родился", "апреля", "апрель"])
+            if "любимая игра" in user_text.lower() or "игра" in user_text.lower():
+                query_keywords.update(["игра", "любимая", "играть", "jedi", "academy"])
+
+            for mem in retrieved_memories_list:
+                mem_text_lower = mem.get('text', '').lower()
+                mem_author = mem.get('author', '')
+                mem_type = mem.get('type', '')
+                score = mem.get('cosine_similarity', 0.0)
+
+                # Проверяем упоминание субъекта в тексте
+                subject_mentioned = query_subject.lower() in mem_text_lower
+
+                # Проверяем наличие ключевых слов
+                keywords_found = sum(1 for kw in query_keywords if kw in mem_text_lower)
+                keyword_ratio = keywords_found / len(query_keywords) if query_keywords else 0
+
+                # Особые случаи для личной информации
+                is_personal_fact = 'personal_info' in mem_type or 'preference' in mem_type
+
+                # Приоритезация
+                if is_personal_fact and (subject_mentioned or mem_author == query_subject):
+                    highly_relevant.append(mem)
+                elif subject_mentioned and score > 0.2:
+                    highly_relevant.append(mem)
+                elif mem_author == query_subject and score > 0.15:
+                    author_relevant.append(mem)
+                elif keyword_ratio > 0.3 and score > 0.2:
+                    keyword_relevant.append(mem)
+                elif score > 0.5:
+                    other_relevant.append(mem)
+
+            # Собираем финальный список
             actual_memories_for_llm = []
-            if retrieved_memories_list:
-                # Простая стратегия: взять топ N, но можно добавить более сложную логику
-                # Например, отдавать предпочтение фактам от Степана, если они есть и релевантны
-                actual_memories_for_llm = sorted(retrieved_memories_list, key=lambda x: x.get('cosine_similarity', 0.0),
-                                                 reverse=True)[:top_n_for_llm_context]
-                # Отфильтруем слишком низкоскоростные, если они попали
-                actual_memories_for_llm = [mem for mem in actual_memories_for_llm if
-                                           mem.get('cosine_similarity', 0.0) > 0.55]
+
+            # Добавляем по приоритету
+            actual_memories_for_llm.extend(highly_relevant[:4])
+            actual_memories_for_llm.extend(author_relevant[:3])
+            actual_memories_for_llm.extend(keyword_relevant[:2])
+            actual_memories_for_llm.extend(other_relevant[:1])
+
+            # Убираем дубликаты
+            seen_ids = set()
+            unique_memories = []
+            for mem in actual_memories_for_llm:
+                if mem.get('id') not in seen_ids:
+                    seen_ids.add(mem.get('id'))
+                    unique_memories.append(mem)
+            actual_memories_for_llm = unique_memories[:7]  # Максимум 7 фактов
+
+            print(
+                f"[{current_time_str_main_llm()}] После умной фильтрации: {len(actual_memories_for_llm)} воспоминаний")
+            for i, mem in enumerate(actual_memories_for_llm):
+                print(
+                    f"  Выбрано {i + 1}: '{mem.get('text', '')[:80]}...' (Score: {mem.get('cosine_similarity', 0):.3f}, Type: {mem.get('type', 'N/A')})")
 
             if actual_memories_for_llm:
-                memory_prompt_header = "\n\n[Джордж, это наиболее релевантные факты и ключевые моменты из твоей памяти. Используй их для формирования точного и содержательного ответа на текущий запрос Степана:]\n"
-                formatted_mem_parts = []
-                for mem_llm in actual_memories_for_llm:
-                    formatted_mem_parts.append(
-                        f"- Факт от {mem_llm.get('author', 'Неизвестно')} (тип: {mem_llm.get('type', 'N/A')}): \"{mem_llm.get('text', '')}\"")
-                retrieved_memories_context_str = memory_prompt_header + "\n".join(
-                    formatted_mem_parts) + "\n[Конец блока воспоминаний. Теперь, учитывая эту информацию и предыдущий диалог, ответь на следующий запрос от Степана:]\n"
+                # Группируем факты по категориям
+                facts_by_category = {}
+                for mem in actual_memories_for_llm:
+                    category = mem.get('type', 'other').replace('fact_', '')
+                    if category not in facts_by_category:
+                        facts_by_category[category] = []
+                    facts_by_category[category].append(mem)
+
+                memory_prompt_header = f"\n\n[Джордж, вот информация из твоей памяти о {query_subject}:]\n"
+                formatted_sections = []
+
+                # Приоритетные категории
+                priority_order = ['personal_info', 'preference', 'event', 'statement', 'other']
+
+                for category in priority_order:
+                    if category in facts_by_category:
+                        section_facts = facts_by_category[category]
+                        if category == 'personal_info':
+                            section_title = "ЛИЧНАЯ ИНФОРМАЦИЯ"
+                        elif category == 'preference':
+                            section_title = "ПРЕДПОЧТЕНИЯ"
+                        elif category == 'event':
+                            section_title = "СОБЫТИЯ"
+                        else:
+                            section_title = category.upper()
+
+                        section_text = f"\n{section_title}:\n"
+                        for fact in section_facts[:3]:
+                            entities = fact.get('custom_meta', {}).get('entities', {})
+                            entities_str = f" [дата: {entities.get('date')}]" if entities.get('date') else ""
+                            section_text += f"• {fact.get('text', '')}{entities_str}\n"
+
+                        formatted_sections.append(section_text)
+
+                retrieved_memories_context_str = memory_prompt_header + "".join(
+                    formatted_sections) + "\n[Используй эту информацию для точного ответа]\n"
 
     final_user_text_for_llm = user_text
     if retrieved_memories_context_str:
@@ -627,8 +758,8 @@ async def get_main_llm_response(user_text: str, screenshot_file_path: str | None
     llm_response_text = await execute_together_api_call(
         model_id=TOGETHER_MODEL_ID,
         messages=messages_for_scout,
-        max_tokens=768,  # Можно увеличить, если ответы часто обрываются
-        temperature=0.75  # Можно немного поднять для большей вариативности, если нужно
+        max_tokens=768,
+        temperature=0.75
     )
 
     if llm_response_text:
@@ -1145,7 +1276,9 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
             f"[{current_time_str()}] Бот уже обрабатывает другой запрос, новый STT '{recognized_text[:50]}...' проигнорирован.")
         return
 
+    # Обработка памяти
     if memory_store_instance and recognized_text:
+        # Сначала проверяем, нужно ли вообще запоминать
         memory_action_details = should_remember_interaction(
             text=recognized_text,
             source="STT",
@@ -1155,52 +1288,86 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
 
         if memory_action_details:
             original_text_to_remember, base_meta_for_memory = memory_action_details
-            action_type = base_meta_for_memory.pop("action_type", "store_as_is")
 
-            chunks_to_save = []
-            if action_type == "chunk_and_store":
-                print(
-                    f"[{current_time_str()}] Запрос LLM-чанкинга для STT текста: '{original_text_to_remember[:50]}...'")
-                chunks_from_llm = await get_text_chunks_from_llm(original_text_to_remember)
-                if chunks_from_llm:
-                    chunks_to_save.extend(chunks_from_llm)
-                else:  # Если чанкер вернул None или пустой список после фильтрации, сохраняем оригинал
-                    print(
-                        f"[{current_time_str()}] LLM-чанкинг не дал валидных чанков для STT. Сохранение оригинального текста.")
-                    chunks_to_save.append(original_text_to_remember.strip())
-            else:  # store_as_is
-                chunks_to_save.append(original_text_to_remember.strip())
-                print(
-                    f"[{current_time_str()}] Сохранение STT текста как есть (без LLM-чанкинга): '{chunks_to_save[0][:50]}...'")
+            # Проверяем, нужно ли извлечение фактов
+            if base_meta_for_memory.get("needs_fact_extraction", False):
+                # Извлекаем факты через LLM
+                extracted_facts = await extract_facts_from_interaction(
+                    recognized_text,
+                    source="STT",
+                    author="Stepan"
+                )
 
-            if chunks_to_save:
-                batch_id_stt = f"stt_batch_{datetime.datetime.now().timestamp()}"
-                for i, chunk_text in enumerate(chunks_to_save):
-                    if not chunk_text: continue
+                if extracted_facts:
+                    # Сохраняем каждый извлечённый факт
+                    for fact_data in extracted_facts:
+                        if fact_data.get('confidence', 0) < 0.6:
+                            continue
 
-                    current_chunk_meta = base_meta_for_memory.copy()
-                    if len(chunks_to_save) > 1:
-                        current_chunk_meta[
-                            "memory_type"] = f"atomic_chunk_{base_meta_for_memory.get('memory_type', 'stt')}"
-                        current_chunk_meta["custom_meta"] = {"batch_id": batch_id_stt, "chunk_order": i,
-                                                             "original_full_text_preview": original_text_to_remember[
-                                                                                           :100]}
+                        fact_text = fact_data.get('fact', '')
+                        if not fact_text:
+                            continue
 
-                    print(
-                        f"[{current_time_str()}] Добавление в память (STT, чанк {i + 1}/{len(chunks_to_save)}): '{chunk_text[:50]}...' Тип: {current_chunk_meta['memory_type']}")
+                        importance = fact_data.get('confidence', 0.5)
+                        if fact_data.get('category') == 'personal_info':
+                            importance *= 1.2
+
+                        memory_meta = {
+                            "source": "STT_extracted",
+                            "author": "Stepan",
+                            "memory_type": f"fact_{fact_data.get('category', 'other')}",
+                            "importance": min(importance, 0.99),
+                            "custom_meta": {
+                                "original_text": recognized_text[:200],
+                                "entities": fact_data.get('entities', {}),
+                                "extraction_confidence": fact_data.get('confidence', 0.5)
+                            }
+                        }
+
+                        print(f"[{current_time_str()}] Сохранение извлечённого факта: '{fact_text}'")
+
+                        try:
+                            memory_store_instance.add_memory(
+                                text=fact_text,
+                                source=memory_meta["source"],
+                                author=memory_meta["author"],
+                                memory_type=memory_meta["memory_type"],
+                                importance=memory_meta["importance"],
+                                custom_meta=memory_meta["custom_meta"],
+                                check_for_semantic_duplicates=True,
+                                semantic_similarity_threshold=0.9
+                            )
+                        except Exception as e_mem_add:
+                            print(f"[{current_time_str()}] Ошибка добавления факта: {e_mem_add}")
+                else:
+                    # Если извлечение не дало результатов, сохраняем как есть
+                    print(f"[{current_time_str()}] Извлечение фактов не дало результатов, сохраняем исходный текст")
                     try:
                         memory_store_instance.add_memory(
-                            text=chunk_text,
-                            source=current_chunk_meta["source"],
-                            author=current_chunk_meta["author"],
-                            memory_type=current_chunk_meta["memory_type"],
-                            importance=current_chunk_meta["importance"],
-                            custom_meta=current_chunk_meta.get("custom_meta", {})
+                            text=original_text_to_remember,
+                            source=base_meta_for_memory["source"],
+                            author=base_meta_for_memory["author"],
+                            memory_type=base_meta_for_memory["memory_type"],
+                            importance=base_meta_for_memory["importance"],
+                            custom_meta={"original_text": original_text_to_remember}
                         )
-                    except Exception as e_mem_add_chunk_stt:
-                        print(f"[{current_time_str()}] Ошибка добавления STT чанка в память: {e_mem_add_chunk_stt}",
-                              exc_info=True)
+                    except Exception as e_mem_add_fallback:
+                        print(f"[{current_time_str()}] Ошибка добавления исходного текста: {e_mem_add_fallback}")
+            else:
+                # Не требуется извлечение фактов, сохраняем как есть
+                print(f"[{current_time_str()}] Сохранение без извлечения фактов: '{original_text_to_remember[:50]}...'")
+                try:
+                    memory_store_instance.add_memory(
+                        text=original_text_to_remember,
+                        source=base_meta_for_memory["source"],
+                        author=base_meta_for_memory["author"],
+                        memory_type=base_meta_for_memory["memory_type"],
+                        importance=base_meta_for_memory["importance"]
+                    )
+                except Exception as e_mem_add_direct:
+                    print(f"[{current_time_str()}] Ошибка прямого добавления: {e_mem_add_direct}")
 
+    # Дальше идёт основная обработка
     is_processing_response = True
     stt_was_initially_enabled = stt_enabled
 
@@ -1264,6 +1431,7 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
             except Exception as e_obs_write:
                 print(f"[{current_time_str()}] Ошибка записи в OBS файл: {e_obs_write}")
 
+            # Сохранение ответа бота в память
             save_this_bot_response = True
             phrases_to_filter_out_bot_response = [
                 "кажется, я не помню", "я не знаю", "моя память коротка",
@@ -1284,53 +1452,19 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
                     bot_name=BOT_NAME_FOR_CHECK
                 )
                 if bot_memory_action_details:
-                    original_bot_response_to_remember, base_bot_meta = bot_memory_action_details
-                    action_type_bot = base_bot_meta.pop("action_type", "store_as_is")
-
-                    bot_chunks_to_save = []
-                    if action_type_bot == "chunk_and_store":
-                        print(
-                            f"[{current_time_str()}] Запрос LLM-чанкинга для ответа бота (STT): '{original_bot_response_to_remember[:50]}...'")
-                        chunks_from_llm_bot = await get_text_chunks_from_llm(original_bot_response_to_remember)
-                        if chunks_from_llm_bot:
-                            bot_chunks_to_save.extend(chunks_from_llm_bot)
-                        else:
-                            print(
-                                f"[{current_time_str()}] LLM-чанкинг ответа бота (STT) не дал валидных чанков. Сохранение оригинала.")
-                            bot_chunks_to_save.append(original_bot_response_to_remember.strip())
-                    else:
-                        bot_chunks_to_save.append(original_bot_response_to_remember.strip())
-                        print(
-                            f"[{current_time_str()}] Сохранение ответа бота (STT) как есть: '{bot_chunks_to_save[0][:50]}...'")
-
-                    if bot_chunks_to_save:
-                        bot_batch_id_stt = f"bot_resp_stt_batch_{datetime.datetime.now().timestamp()}"
-                        for i, bot_chunk_text in enumerate(bot_chunks_to_save):
-                            if not bot_chunk_text: continue
-
-                            current_bot_chunk_meta = base_bot_meta.copy()
-                            if len(bot_chunks_to_save) > 1:
-                                current_bot_chunk_meta[
-                                    "memory_type"] = f"atomic_chunk_{base_bot_meta.get('memory_type', 'bot_resp_stt')}"  # Уточнил тип
-                                current_bot_chunk_meta["custom_meta"] = {"batch_id": bot_batch_id_stt, "chunk_order": i,
-                                                                         "original_full_text_preview": original_bot_response_to_remember[
-                                                                                                       :100]}
-
-                            print(
-                                f"[{current_time_str()}] Добавление в память (Ответ бота на STT, чанк {i + 1}/{len(bot_chunks_to_save)}): '{bot_chunk_text[:50]}...' Тип: {current_bot_chunk_meta['memory_type']}")
-                            try:
-                                memory_store_instance.add_memory(
-                                    text=bot_chunk_text,
-                                    source=current_bot_chunk_meta["source"],
-                                    author=current_bot_chunk_meta["author"],
-                                    memory_type=current_bot_chunk_meta["memory_type"],
-                                    importance=current_bot_chunk_meta["importance"],
-                                    custom_meta=current_bot_chunk_meta.get("custom_meta", {})
-                                )
-                            except Exception as e_mem_add_bot_chunk_stt:
-                                print(
-                                    f"[{current_time_str()}] Ошибка добавления чанка ответа бота (STT) в память: {e_mem_add_bot_chunk_stt}",
-                                    exc_info=True)
+                    bot_text, bot_meta = bot_memory_action_details
+                    try:
+                        memory_store_instance.add_memory(
+                            text=bot_text,
+                            source=bot_meta["source"],
+                            author=bot_meta["author"],
+                            memory_type=bot_meta["memory_type"],
+                            importance=bot_meta["importance"],
+                            custom_meta={"response_to": recognized_text[:100]}
+                        )
+                        print(f"[{current_time_str()}] Ответ бота сохранён в память")
+                    except Exception as e_bot_mem:
+                        print(f"[{current_time_str()}] Ошибка сохранения ответа бота: {e_bot_mem}")
 
             await speak_text(llm_response)
             with audio_queue.mutex:
@@ -1346,7 +1480,7 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
         import traceback
         traceback.print_exc()
     finally:
-        if screenshot_file_to_send:  # screenshot_file_to_send объявляется в начале функции
+        if screenshot_file_to_send:
             await asyncio.to_thread(delete_screenshot_file, screenshot_file_to_send)
         is_processing_response = False
         if stt_was_initially_enabled:
@@ -1445,6 +1579,8 @@ async def main_async():
     stt_task = asyncio.create_task(stt_processing_loop(), name="STTLoop")
     monologue_task = asyncio.create_task(monologue_loop(), name="MonologueLoop")
     active_tasks = {twitch_task, stt_task, monologue_task}
+    consolidation_task = asyncio.create_task(memory_consolidation_loop(), name="MemoryConsolidation")
+    active_tasks.add(consolidation_task)
 
     while recording_active.is_set() and active_tasks:
         done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1489,88 +1625,111 @@ def should_remember_interaction(text: str, source: str, author: str, bot_name: s
     action = "store_as_is"
     base_importance = 0.5
     final_memory_type = ""
+    needs_fact_extraction = False
 
-    is_explicit_fact_from_stepan = False
+    # Для STT от Степана - всегда извлекаем факты через LLM
     if source == "STT" and author == "Stepan":
-        direct_fact_keywords = ["мой день рождения", "меня зовут", "моя любимая игра", "я люблю", "я не люблю",
-                                "запомни точно:", "это факт:"]
-        if any(keyword in text_lower for keyword in direct_fact_keywords) and \
-                not text.endswith("?") and len(text.split()) < 25 and "запомни эти факты" not in text_lower:
-            is_explicit_fact_from_stepan = True
-            base_importance = 0.98
-            action = "store_as_is"
-            # Пытаемся определить более конкретный тип факта
-            if "день рождения" in text_lower or "родился" in text_lower:
-                final_memory_type = "fact_user_bday_explicit"
-            elif "зовут" in text_lower and "меня" in text_lower:
-                final_memory_type = "fact_user_name_explicit"
-            elif "любимая игра" in text_lower:
-                final_memory_type = "fact_user_game_preference_explicit"
-            elif "кофе" in text_lower and (
-                    "люблю" in text_lower or "не люблю" in text_lower or "предпочитаю" in text_lower):
-                final_memory_type = "fact_user_coffee_preference_explicit"
+        # Проверяем, не является ли это просто командой или вопросом
+        is_pure_question = text.endswith("?") and len(text.split()) < 10
+        is_command = any(cmd in text_lower for cmd in ["скажи", "сделай", "покажи", "включи", "выключи"])
+
+        if is_pure_question or is_command:
+            # Короткие вопросы и команды не требуют извлечения фактов
+            memory_params = {
+                "memory_type": "user_question_stt" if is_pure_question else "user_command_stt",
+                "importance": 0.3,
+                "needs_fact_extraction": False
+            }
+        else:
+            # Всё остальное идёт на извлечение фактов
+            needs_fact_extraction = True
+
+            # Повышаем важность для явных указаний запомнить
+            if "запомни" in text_lower or "это важно" in text_lower:
+                base_importance = 0.9
             else:
-                final_memory_type = "fact_user_provided_explicit"
-            memory_params = {"memory_type": final_memory_type, "importance": base_importance}
+                base_importance = 0.7
 
-    if not memory_params:
-        if source == "STT" and author == "Stepan":
-            if "?" in text or any(cmd in text_lower for cmd in
-                                  ["скажи", "сделай", "посмотри", "что это", "когда", "почему", "вспомни", "расскажи"]):
-                memory_params = {"memory_type": "user_question_stt", "importance": 0.7}
-            elif "запомни" in text_lower:
-                memory_params = {"memory_type": "user_command_remember_stt", "importance": 0.95}
-                if len(text.split()) > 10:
-                    action = "chunk_and_store"
-            elif len(text.split()) > 40:
-                memory_params = {"memory_type": "user_long_statement_stt", "importance": 0.7}
-                action = "chunk_and_store"
-            elif len(text.split()) > 3:
-                memory_params = {"memory_type": "user_statement_stt", "importance": 0.65}
+            memory_params = {
+                "memory_type": "stt_for_extraction",
+                "importance": base_importance,
+                "needs_fact_extraction": True
+            }
 
-        elif source == "twitch_chat":
-            trigger_parts = [p.lower() for p in bot_name.split() if len(p) > 2]
-            mentioned_by_name = any(trig in text_lower for trig in trigger_parts)
-            if mentioned_by_name:
-                memory_params = {"memory_type": "direct_mention_chat", "importance": 0.6}
-            elif len(text.split()) > 25:
-                memory_params = {"memory_type": "long_chat_message", "importance": 0.3}
-                action = "chunk_and_store"
+    # Для чата - извлекаем факты только из важных сообщений
+    elif source == "twitch_chat":
+        trigger_parts = [p.lower() for p in bot_name.split() if len(p) > 2]
+        mentioned_by_name = any(trig in text_lower for trig in trigger_parts)
 
-        elif source == "bot_response" or source == "bot_response_chat":
-            phrases_to_filter_out = [
-                "кажется, я не помню", "я не знаю", "моя память коротка",
-                "отсутствует в моей базе", "я мог ошибиться", "не буду гадать",
-                "мои файлы говорят", "мои логи говорят", "я не сохранил эту информацию",
-                "напомни ещё раз", "хочешь освежить", "кажется, мы уже обсуждали",
-                "это где-то...", "наверное?"
-            ]
-            if any(phrase in text_lower for phrase in phrases_to_filter_out):
-                print(
-                    f">>> FILTERED BOT RESPONSE: Ответ бота содержит фразы неуверенности, НЕ запоминаем: '{text[:60]}...'")
-                return None
+        if mentioned_by_name:
+            # Если сообщение содержит факты о пользователе или важную информацию
+            fact_indicators = ["я", "мой", "моя", "мне", "у меня", "родился", "живу", "работаю", "учусь"]
+            contains_personal_info = any(indicator in text_lower for indicator in fact_indicators)
 
-            if len(text.split()) > 35:
-                memory_params = {"memory_type": "bot_detailed_statement", "importance": 0.55}
-                action = "chunk_and_store"
-            elif len(text.split()) > 5:
-                memory_params = {"memory_type": "bot_concise_statement", "importance": 0.5}
+            if contains_personal_info and len(text.split()) > 5:
+                needs_fact_extraction = True
+                memory_params = {
+                    "memory_type": "chat_for_extraction",
+                    "importance": 0.6,
+                    "needs_fact_extraction": True
+                }
+            else:
+                memory_params = {
+                    "memory_type": "direct_mention_chat",
+                    "importance": 0.4,
+                    "needs_fact_extraction": False
+                }
+        elif len(text.split()) > 40:
+            # Длинные сообщения могут содержать факты
+            memory_params = {
+                "memory_type": "long_chat_message",
+                "importance": 0.3,
+                "needs_fact_extraction": True
+            }
+
+    # Для ответов бота - сохраняем только уверенные утверждения
+    elif source in ["bot_response", "bot_response_chat"]:
+        phrases_to_filter_out = [
+            "кажется, я не помню", "я не знаю", "моя память коротка",
+            "отсутствует в моей базе", "я мог ошибиться", "не буду гадать",
+            "мои файлы говорят", "мои логи говорят", "я не сохранил эту информацию",
+            "напомни ещё раз", "хочешь освежить", "кажется, мы уже обсуждали",
+            "это где-то...", "наверное?", "возможно", "вероятно"
+        ]
+
+        if any(phrase in text_lower for phrase in phrases_to_filter_out):
+            print(
+                f">>> FILTERED BOT RESPONSE: Ответ бота содержит фразы неуверенности, НЕ запоминаем: '{text[:60]}...'")
+            return None
+
+        # Ответы бота обычно уже структурированы, не требуют извлечения
+        if len(text.split()) > 35:
+            memory_params = {
+                "memory_type": "bot_detailed_statement",
+                "importance": 0.5,
+                "needs_fact_extraction": False  # Бот уже выдаёт структурированный ответ
+            }
+        elif len(text.split()) > 5:
+            memory_params = {
+                "memory_type": "bot_concise_statement",
+                "importance": 0.45,
+                "needs_fact_extraction": False
+            }
 
     if memory_params:
-        # 'text', 'source', 'author' должны быть добавлены, если они не были частью memory_params
-        if "text" not in memory_params: memory_params["text"] = text
-        if "source" not in memory_params: memory_params["source"] = source
-        if "author" not in memory_params: memory_params["author"] = author
-
         final_meta = {
-            "source": memory_params["source"],
-            "author": memory_params["author"],
+            "source": source,
+            "author": author,
             "memory_type": memory_params["memory_type"],
             "importance": memory_params.get("importance", base_importance),
-            "action_type": memory_params.get("action", action)
-            # Приоритет 'action' из memory_params, потом локальная переменная 'action'
+            "needs_fact_extraction": memory_params.get("needs_fact_extraction", needs_fact_extraction),
+            "original_text": text  # Сохраняем оригинальный текст для контекста
         }
-        return memory_params["text"], final_meta
+
+        # Возвращаем текст и метаданные
+        # Если нужно извлечение фактов, обработка будет выполнена позже
+        return text, final_meta
+
     return None
 
 
@@ -1670,6 +1829,132 @@ async def get_text_chunks_from_llm(text_to_chunk: str) -> list[str] | None:
             f"[{current_timestamp}] Модель чанкинга ({CHUNKING_MODEL_ID}) не вернула текстовый ответ. Будет использован оригинальный текст.")
         return [text_to_chunk.strip()]
 
+
+async def extract_facts_from_interaction(raw_text: str, source: str, author: str) -> list[dict] | None:
+    """Извлекает структурированные факты из сырого текста через LLM"""
+    global CHUNKING_MODEL_ID, client_together
+
+    if not client_together or not raw_text.strip():
+        return None
+
+    current_time = datetime.datetime.now().strftime('%H:%M:%S')
+
+    # Контекстуальный промпт в зависимости от источника
+    context_hint = ""
+    if source == "STT" and author == "Stepan":
+        context_hint = "Это устная речь Степана (стримера), могут быть оговорки и разговорные выражения."
+    elif source == "twitch_chat":
+        context_hint = f"Это сообщение из чата Twitch от пользователя {author}."
+
+    system_prompt = """Ты - система извлечения фактов для AI-ассистента по имени Джордж Дроид.
+Твоя задача - извлечь ТОЛЬКО конкретные, полезные факты из предоставленного текста.
+
+КРИТИЧЕСКИ ВАЖНО: Отвечай ТОЛЬКО валидным JSON массивом фактов. Никакого другого текста!
+
+Правила извлечения:
+1. Извлекай только КОНКРЕТНЫЕ факты (даты, имена, предпочтения, события)
+2. Игнорируй: приветствия, вопросы, команды, междометия, повторы
+3. Нормализуй даты в формат YYYY-MM-DD
+4. Исправляй очевидные опечатки
+5. Если факт неполный или неясный - пропусти его
+6. ВАЖНО: Для фактов о людях ВСЕГДА указывай имя человека в тексте факта
+7. Создавай расширенные формулировки для лучшего поиска:
+   - Включай альтернативные формулировки (день рождения/родился/дата рождения)
+   - Добавляй контекст (любимая игра/предпочитает играть/часто играет)
+
+Примеры правильного извлечения:
+- "Меня зовут Степан" → {"fact": "Степана зовут Степан. Имя стримера - Степан.", "category": "personal_info", "confidence": 1.0, "entities": {"person": "Степан"}}
+- "Мой день рождения 14 апреля" → {"fact": "День рождения Степана - 14 апреля. Степан родился 14 апреля.", "category": "personal_info", "confidence": 0.9, "entities": {"person": "Степан", "date": "YYYY-04-14"}}
+- "Люблю играть в Jedi Academy" → {"fact": "Степан любит играть в Star Wars Jedi Knight Jedi Academy. Любимая игра Степана - Jedi Academy.", "category": "preference", "confidence": 0.9, "entities": {"person": "Степан", "game": "Jedi Academy"}}
+
+Формат ответа - JSON массив:
+[
+  {
+    "fact": "текст факта с именем человека и альтернативными формулировками",
+    "category": "personal_info|preference|event|statement|other",
+    "confidence": 0.1-1.0,
+    "entities": {"person": "имя", "date": "YYYY-MM-DD", ...}
+  }
+]
+
+Если фактов нет, верни пустой массив: []"""
+
+    user_prompt = f"""{context_hint}
+Автор высказывания: {author}
+
+Извлеки факты из следующего текста:
+"{raw_text}"
+
+Ответ (ТОЛЬКО JSON):"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        response = await execute_together_api_call(
+            model_id=CHUNKING_MODEL_ID,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.1
+        )
+
+        if response:
+            # Извлекаем JSON из ответа
+            json_match = re.search(r'\[.*?\]', response, re.DOTALL)
+            if json_match:
+                facts = json.loads(json_match.group())
+                print(f"[{current_time}] Извлечено {len(facts)} фактов из '{raw_text[:50]}...'")
+
+                # Дополнительная валидация и обогащение
+                validated_facts = []
+                for fact in facts:
+                    if fact.get('fact') and fact.get('category'):
+                        # Убеждаемся, что имя автора есть в факте
+                        # Убеждаемся, что имя автора есть в факте
+                        if author not in fact['fact'] and 'personal' in fact.get('category', ''):
+                            # Заменяем только целые слова
+                            import re
+                            fact['fact'] = re.sub(r'\bя\b', author, fact['fact'], flags=re.IGNORECASE)
+                            fact['fact'] = re.sub(r'\bмой\b', f"{author} имеет", fact['fact'], flags=re.IGNORECASE)
+                            fact['fact'] = re.sub(r'\bмоя\b', f"у {author}", fact['fact'], flags=re.IGNORECASE)
+                            fact['fact'] = re.sub(r'\bмне\b', author, fact['fact'], flags=re.IGNORECASE)
+
+                        validated_facts.append(fact)
+
+                return validated_facts if validated_facts else None
+
+    except Exception as e:
+        print(f"[{current_time}] Ошибка извлечения фактов: {e}")
+
+    return None
+
+
+async def memory_consolidation_loop():
+    """Периодически анализирует и консолидирует память"""
+    global memory_store_instance, recording_active
+
+    while recording_active.is_set():
+        await asyncio.sleep(300)  # Каждые 5 минут
+
+        if not memory_store_instance:
+            continue
+
+        try:
+            # Получаем все воспоминания
+            all_memories = memory_store_instance.retrieve_memories(
+                "анализ всех фактов",  # Общий запрос
+                top_k=100
+            )
+
+            # Группируем похожие факты
+            # TODO: Реализовать умную консолидацию через LLM
+
+            print(f"[Memory] Проверка консолидации: {len(all_memories)} фактов в памяти")
+
+        except Exception as e:
+            print(f"[Memory] Ошибка консолидации: {e}")
 
 if __name__ == "__main__":
     print("-" * 40 + "\nЗапуск программы...\n" + "-" * 40)
