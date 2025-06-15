@@ -1833,6 +1833,7 @@ async def get_text_chunks_from_llm(text_to_chunk: str) -> list[str] | None:
 async def extract_facts_from_interaction(raw_text: str, source: str, author: str) -> list[dict] | None:
     """Извлекает структурированные факты из сырого текста через LLM"""
     global CHUNKING_MODEL_ID, client_together
+    import re
 
     if not client_together or not raw_text.strip():
         return None
