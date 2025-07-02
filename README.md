@@ -14,8 +14,8 @@ TTS (Piper), and an **advanced contextual memory system (RAG)** with intelligent
 
 George-Droid — многофункциональный стриминговый ИИ-компаньон на Python. Он распознаёт речь, остроумно отвечает и
 общается с чатом Twitch.  
-Работает через Together AI (с моделями типа Meta Llama 4 Scout), STT через Faster-Whisper, озвучка через Piper, и *
-*продвинутую систему контекстной памяти (RAG)** с умным извлечением и консолидацией фактов.
+Работает через Together AI (с моделями типа Meta Llama 4 Scout), STT через Faster-Whisper, озвучка через Piper, и 
+**продвинутую систему контекстной памяти (RAG)** с умным извлечением и консолидацией фактов.
 
 ---
 
