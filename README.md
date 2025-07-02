@@ -109,7 +109,7 @@ PIPER_EXE_PATH=piper_tts_bin/piper.exe
 PIPER_VOICE_MODEL_PATH=voices/ru_RU-ruslan-medium.onnx
 PIPER_VOICE_CONFIG_PATH=voices/ru_RU-ruslan-medium.onnx.json
 
-# CUDA/CUDNN Configuration (Optional) | Конфигурация CUDA/CUDNN (Опционально)
+# CUDA/CUDNN Configuration (Necessary) | Конфигурация CUDA/CUDNN (Обязательно)
 CUDNN_PATH=C:\Program Files\NVIDIA\CUDNN\v9.8\bin\12.8
 ```
 
@@ -126,7 +126,7 @@ CUDNN_PATH=C:\Program Files\NVIDIA\CUDNN\v9.8\bin\12.8
 
 ### Bot Personality | Личность бота
 
-- Edit `SYSTEM_PROMPT` in `main.py` to change the bot's personality | Отредактируйте `SYSTEM_PROMPT` в `main.py` для
+- Edit `SYSTEM_PROMPT` in `config/settings.py` to change the bot's personality | Отредактируйте `SYSTEM_PROMPT` в `config/settings.py` для
   изменения личности бота
 - Modify `BOT_NAME_FOR_CHECK` to change trigger name in chat | Измените `BOT_NAME_FOR_CHECK` для изменения триггерного
   имени в чате
