@@ -1,29 +1,26 @@
+import asyncio
+import base64
+import datetime
+import json
 import os
+import queue
+import re
+import subprocess
 import sys
-from typing import Any
+import tempfile
+import threading
+import time
+from threading import Event
 
 import keyboard
-from dotenv import load_dotenv
-import twitchio
-import aiohttp
-import json
-import datetime
-import time
-import asyncio
-import subprocess
-import io
-import sounddevice as sd
-import numpy as np
-import wave
-import scipy.signal
-import queue
-import threading
-import random
-import re
-from PIL import Image
 import mss
-import tempfile
-import base64
+import numpy as np
+import scipy.signal
+import sounddevice as sd
+import twitchio
+from PIL import Image
+from dotenv import load_dotenv
+
 from backend.memory_store import MemoryStore
 
 load_dotenv()
@@ -123,7 +120,8 @@ last_activity_time = time.time()
 INACTIVITY_THRESHOLD_SECONDS = 60
 stt_enabled = True
 chat_interaction_enabled = True
-is_processing_response = False
+is_processing_event = Event()  # Event по умолчанию False/cleared
+processing_async_lock = None  # Инициализируется в main_async
 tts_lock = asyncio.Lock()
 chosen_output_device_id = None
 
@@ -356,7 +354,6 @@ def delete_screenshot_file(file_path: str):
             print(f"Временный скриншот удален: {file_path}")
         except Exception as e:
             print(f"Ошибка при удалении временного скриншота {file_path}: {e}", file=sys.stderr)
-
 
 
 async def execute_together_api_call(model_id: str, messages: list, max_tokens: int, temperature: float,
@@ -784,16 +781,23 @@ def resample_audio(audio_data: np.ndarray, input_rate: int, target_rate: int) ->
 
 
 def audio_recording_thread(device_index=None):
-    global audio_queue, recording_active, stt_enabled, is_processing_response
+    global audio_queue, recording_active, stt_enabled
 
     def audio_callback(indata, frames, time, status):
         if status:
             print(f"Audio Status: {status}", file=sys.stderr)
-        if recording_active.is_set() and stt_enabled and not is_processing_response:
+        # Тройная проверка условий + проверка размера очереди
+        if (recording_active.is_set() and
+                stt_enabled and
+                not is_processing_event.is_set() and
+                audio_queue.qsize() < 1000):  # Предотвращаем переполнение
             try:
                 audio_queue.put_nowait(indata.copy())
             except queue.Full:
+                # Если очередь полная, пропускаем кадр
                 pass
+            except Exception as e:
+                print(f"[AUDIO] Unexpected error in callback: {e}", file=sys.stderr)
 
     stream = None
     try:
@@ -1017,7 +1021,7 @@ class SimpleBot(twitchio.Client):
     async def event_message(self, message: twitchio.Message):
         if message.echo: return
 
-        global chat_interaction_enabled, is_processing_response, last_activity_time
+        global chat_interaction_enabled, last_activity_time
         global BOT_NAME_FOR_CHECK, OBS_OUTPUT_FILE, stt_enabled, audio_queue, client_together
         global memory_store_instance
 
@@ -1040,13 +1044,15 @@ class SimpleBot(twitchio.Client):
 
         if not mentioned and not highlighted: return
 
-        if is_processing_response:
+        # Проверяем флаг обработки через Event
+        if is_processing_event.is_set():
             print(f"[{current_time_str_chat()}] Бот занят (чат). Игнор сообщения от {author_name}.")
             return
 
         stt_was_on_before_chat_processing = False
         try:
-            is_processing_response = True
+            # Устанавливаем флаг обработки
+            is_processing_event.set()
             last_activity_time = time.time()
             print(f"[{current_time_str_chat()}] {author_name}: {message.content}")
 
@@ -1211,19 +1217,21 @@ class SimpleBot(twitchio.Client):
             print(f"[{current_time_str_chat()}] КРИТ. ОШИБКА event_message: {e_event_msg}", exc_info=True)
             if stt_was_on_before_chat_processing: stt_enabled = True
         finally:
-            is_processing_response = False
+            # Гарантированно сбрасываем флаг обработки
+            is_processing_event.clear()
 
 
 async def stt_processing_loop():
-    global audio_queue, recording_active, stt_model, stt_enabled, is_processing_response
+    global audio_queue, recording_active, stt_model, stt_enabled
     silence_blocks = int(VAD_SILENCE_TIMEOUT_MS / (BLOCKSIZE / SOURCE_SAMPLE_RATE * 1000))
     min_speech = int(VAD_MIN_SPEECH_MS / (BLOCKSIZE / SOURCE_SAMPLE_RATE * 1000))
     pad_blocks = int(VAD_SPEECH_PAD_MS / (BLOCKSIZE / SOURCE_SAMPLE_RATE * 1000))
     is_speaking, silence_count, speech_buf, pad_buf = False, 0, [], []
 
     while recording_active.is_set():
-        if not stt_enabled or is_processing_response:
-            if is_processing_response and is_speaking:
+        # Проверяем Event вместо переменной
+        if not stt_enabled or is_processing_event.is_set():
+            if is_processing_event.is_set() and is_speaking:
                 is_speaking, speech_buf, pad_buf, silence_count = False, [], [], 0
             await asyncio.sleep(0.1)
             continue
@@ -1251,7 +1259,7 @@ async def stt_processing_loop():
 
 
 async def process_recognized_speech(audio_buffer_list, source_id="STT"):
-    global is_processing_response, stt_enabled, audio_queue, last_activity_time
+    global stt_enabled, audio_queue, last_activity_time
     global OBS_OUTPUT_FILE, client_together, TOGETHER_MODEL_ID, BOT_NAME_FOR_CHECK
     global memory_store_instance
 
@@ -1271,7 +1279,8 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
         print(f"[{current_time_str()}] STT не вернул текст.")
         return
 
-    if is_processing_response:
+    # Проверяем, не обрабатывается ли уже другой запрос
+    if is_processing_event.is_set():
         print(
             f"[{current_time_str()}] Бот уже обрабатывает другой запрос, новый STT '{recognized_text[:50]}...' проигнорирован.")
         return
@@ -1368,7 +1377,8 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
                     print(f"[{current_time_str()}] Ошибка прямого добавления: {e_mem_add_direct}")
 
     # Дальше идёт основная обработка
-    is_processing_response = True
+    # Устанавливаем флаг обработки
+    is_processing_event.set()
     stt_was_initially_enabled = stt_enabled
 
     if stt_enabled:
@@ -1379,12 +1389,16 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
     with audio_queue.mutex:
         audio_queue.queue.clear()
 
+    # Дополнительная задержка для гарантии применения изменений
+    await asyncio.sleep(0.05)
+
     last_activity_time = time.time()
     print(f"[{current_time_str()}] STT Распознано ({source_id}): {recognized_text}")
 
     if not client_together:
         print(f"[{current_time_str()}] Клиент Together AI не настроен, обработка STT невозможна.")
-        is_processing_response = False
+        # Гарантированно сбрасываем флаг обработки
+        is_processing_event.clear()
         if stt_was_initially_enabled:
             stt_enabled = True
             print(f"[{current_time_str()}] STT восстановлен (клиент не настроен).")
@@ -1482,7 +1496,12 @@ async def process_recognized_speech(audio_buffer_list, source_id="STT"):
     finally:
         if screenshot_file_to_send:
             await asyncio.to_thread(delete_screenshot_file, screenshot_file_to_send)
-        is_processing_response = False
+        # Гарантированно сбрасываем флаг обработки
+        is_processing_event.clear()
+
+        # Восстанавливаем STT с небольшой задержкой
+        await asyncio.sleep(0.05)
+
         if stt_was_initially_enabled:
             stt_enabled = True
             print(f"[{current_time_str()}] STT снова ВКЛЮЧЕН (обработка завершена).")
@@ -1499,16 +1518,18 @@ async def monologue_loop():
         if not client_together:
             continue
 
-        if is_processing_response or not chat_interaction_enabled:
+        # Проверяем флаг обработки через Event
+        if is_processing_event.is_set() or not chat_interaction_enabled:
             continue
         if time.time() - last_activity_time > INACTIVITY_THRESHOLD_SECONDS:
             current_time = datetime.datetime.now().strftime('%H:%M:%S')
-            if is_processing_response or not chat_interaction_enabled:
+            if is_processing_event.is_set() or not chat_interaction_enabled:
                 continue
 
             stt_was_initially_enabled = stt_enabled
             try:
-                is_processing_response = True
+                # Устанавливаем флаг обработки
+                is_processing_event.set()
                 if stt_enabled: stt_enabled = False
                 with audio_queue.mutex:
                     audio_queue.queue.clear()
@@ -1531,7 +1552,8 @@ async def monologue_loop():
             except Exception as e:
                 print(f"[{current_time}] КРИТ. ОШИБКА monologue_loop: {e}")
             finally:
-                is_processing_response = False
+                # Гарантированно сбрасываем флаг обработки
+                is_processing_event.clear()
                 stt_enabled = stt_was_initially_enabled
 
 
@@ -1565,7 +1587,11 @@ def hotkey_listener_thread():
 
 
 async def main_async():
-    global recording_active, client_together
+    global recording_active, client_together, processing_async_lock
+
+    # Инициализируем asyncio Lock
+    processing_async_lock = asyncio.Lock()
+
     print("Запуск AI Twitch Bot...");
     if not TWITCH_ACCESS_TOKEN:
         print("ОШИБКА: Нет TWITCH_ACCESS_TOKEN!");
@@ -1581,6 +1607,12 @@ async def main_async():
     active_tasks = {twitch_task, stt_task, monologue_task}
     consolidation_task = asyncio.create_task(memory_consolidation_loop(), name="MemoryConsolidation")
     active_tasks.add(consolidation_task)
+
+    # Добавляем диагностические задачи
+    diagnostic_task = asyncio.create_task(diagnostic_loop(), name="DiagnosticLoop")
+    watchdog_task = asyncio.create_task(processing_watchdog(), name="ProcessingWatchdog")
+    active_tasks.add(diagnostic_task)
+    active_tasks.add(watchdog_task)
 
     while recording_active.is_set() and active_tasks:
         done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1813,7 +1845,7 @@ async def get_text_chunks_from_llm(text_to_chunk: str) -> list[str] | None:
         if valid_chunks:
             if len(valid_chunks) == 1 and (
                     valid_chunks[0] == text_to_chunk.strip() or len(valid_chunks[0]) > 0.85 * len(
-                    text_to_chunk.strip())):  # Немного ослабил порог
+                text_to_chunk.strip())):  # Немного ослабил порог
                 print(
                     f"[{current_timestamp}] Модель чанкинга ({CHUNKING_MODEL_ID}) вернула 1 валидный чанк, похожий на исходный. Используем его.")
             else:
@@ -1932,6 +1964,52 @@ async def extract_facts_from_interaction(raw_text: str, source: str, author: str
     return None
 
 
+# Добавляем диагностические функции
+async def diagnostic_loop():
+    """Периодическая диагностика состояния системы"""
+    while recording_active.is_set():
+        await asyncio.sleep(5)  # Каждые 5 секунд
+
+        queue_size = audio_queue.qsize()
+        processing = is_processing_event.is_set()
+
+        if queue_size > 100 or (processing and queue_size > 10):
+            print(f"[DIAG] Warning: Audio queue size: {queue_size}, Processing: {processing}, STT: {stt_enabled}")
+
+            # Принудительная очистка при переполнении
+            if queue_size > 500:
+                with audio_queue.mutex:
+                    audio_queue.queue.clear()
+                print("[DIAG] Force cleared audio queue due to overflow")
+
+
+async def processing_watchdog():
+    """Следит за тем, чтобы флаг обработки не завис"""
+    MAX_PROCESSING_TIME = 120  # 2 минуты максимум на обработку
+
+    while recording_active.is_set():
+        await asyncio.sleep(10)  # Проверка каждые 10 секунд
+
+        if is_processing_event.is_set():
+            # Запоминаем время начала обработки
+            start_time = time.time()
+
+            # Ждём завершения или таймаута
+            while is_processing_event.is_set() and recording_active.is_set():
+                if time.time() - start_time > MAX_PROCESSING_TIME:
+                    print(f"[WATCHDOG] Processing timeout detected! Force clearing after {MAX_PROCESSING_TIME}s")
+                    is_processing_event.clear()
+
+                    # Восстанавливаем STT если был включен
+                    global stt_enabled
+                    if not stt_enabled:
+                        stt_enabled = True
+                        print("[WATCHDOG] Force re-enabled STT")
+                    break
+
+                await asyncio.sleep(1)
+
+
 async def memory_consolidation_loop():
     """Периодически анализирует и консолидирует память"""
     global memory_store_instance, recording_active
@@ -1956,6 +2034,7 @@ async def memory_consolidation_loop():
 
         except Exception as e:
             print(f"[Memory] Ошибка консолидации: {e}")
+
 
 if __name__ == "__main__":
     print("-" * 40 + "\nЗапуск программы...\n" + "-" * 40)
@@ -1998,8 +2077,6 @@ if __name__ == "__main__":
     except Exception as e_mem_init:
         print(f"КРИТИЧЕСКАЯ ОШИБКА инициализации MemoryStore: {e_mem_init}")
         memory_store_instance = None
-
-
 
     stt_model = None
     try:
@@ -2050,6 +2127,7 @@ if __name__ == "__main__":
                 default_mic = input_device_index
                 mic_info = sd.query_devices(default_mic)
                 if isinstance(mic_info, dict): mic_name = mic_info.get('name', 'N/A')
+                ame = mic_info.get('name', 'N/A')
     except Exception as e_mic:
         print(f"Ошибка определения микрофона по умолчанию: {e_mic}.")
     print(

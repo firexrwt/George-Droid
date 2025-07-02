@@ -9,33 +9,63 @@
 
 George-Droid is a multifunctional streaming assistant built in Python. It listens to your voice, responds with humor,
 and interacts with your Twitch chat like a true co-host.  
-Powered by Together AI (with models like Meta's Llama 4 Scout Instruct or any compatible Together AI model), real-time
-speech recognition (Faster-Whisper), TTS (Piper), and a **contextual memory system (RAG)**. Intelligence of the bot
-scales with the chosen model (by default
-llama-4-scout-17b is used as the main LLM, faster-whisper medium with compute type int8 for STT). Change the
-voice by swapping `.onnx` and `.onnx.json` files in `voices/` and updating `VOICE_MODEL_PATH` & `VOICE_CONFIG_PATH`.
+Powered by Together AI (with models like Meta's Llama 4 Scout Instruct), real-time speech recognition (Faster-Whisper),
+TTS (Piper), and an **advanced contextual memory system (RAG)** with intelligent fact extraction and consolidation.
 
 George-Droid — многофункциональный стриминговый ИИ-компаньон на Python. Он распознаёт речь, остроумно отвечает и
 общается с чатом Twitch.  
-Работает через Together AI (с моделями типа Meta Llama 4 Scout Instruct или любой совместимой моделью), STT через
-Faster-Whisper, озвучка через Piper, и **система контекстной памяти (RAG)**. Интеллект бота зависит от выбранной
-модели (по умолчанию llama-4-scout-17b для
-LLM, faster-whisper medium с compute type int8 для STT). Голос можно поменять, заменив файлы `.onnx` и
-`.onnx.json` в `voices/` и обновив `VOICE_MODEL_PATH` и `VOICE_CONFIG_PATH`.
+Работает через Together AI (с моделями типа Meta Llama 4 Scout), STT через Faster-Whisper, озвучка через Piper, и *
+*продвинутую систему контекстной памяти (RAG)** с умным извлечением и консолидацией фактов.
 
 ---
 
 ## 🚀 Features | Возможности
 
-- 🧠 Together AI LLM (e.g., Llama 4 Scout Instruct) for smart replies • Ответы от LLM через Together AI (например, Llama
-  4 Scout Instruct)
-- 🎙️ Faster-Whisper STT + VAD • Распознавание речи с VAD
-- 🗣️ Piper TTS • Голосовая озвучка
-- 💬 Twitch chat bot (triggered by name/highlight) • Бот в чате Twitch
-- 🔁 Idle monologues, hotkey toggles • Монологи во время тишины, управление горячими клавишами
-- 🧠 **Contextual Memory (RAG)** powered by Sentence Transformers and FAISS for enhanced recall • **Контекстная Память (
-  RAG)** на базе Sentence Transformers и FAISS для улучшенного вспоминания
-- 📸 **Visual Context** with Screenshots for LLM analysis • **Визуальный Контекст** со скриншотами для анализа LLM
+- 🧠 **Multi-Model AI System** • **Мульти-модельная ИИ система**
+    - Main LLM: `meta-llama/Llama-4-Scout-17B-16E-Instruct` for responses
+    - Context Analysis: `meta-llama/Llama-3.2-3B-Instruct-Turbo` for screenshot detection & memory query context
+    - Memory Processing: `meta-llama/Llama-3.3-70B-Instruct-Turbo-Free` for fact extraction & memory storage
+
+- 🎙️ **Advanced Voice Processing** • **Продвинутая обработка голоса**
+    - Faster-Whisper STT with VAD (Voice Activity Detection) | Faster-Whisper STT с VAD (детекция голосовой активности)
+    - Configurable models (medium/large) with CUDA acceleration | Настраиваемые модели (medium/large) с ускорением CUDA
+    - Real-time speech recognition with noise filtering | Распознавание речи в реальном времени с фильтрацией шума
+
+- 🗣️ **High-Quality TTS** • **Качественная озвучка**
+    - Piper TTS with custom voice models | Piper TTS с пользовательскими моделями голосов
+    - Async audio processing with device selection | Асинхронная обработка аудио с выбором устройства
+    - Russian voice support (ru_RU-ruslan-medium) | Поддержка русских голосов (ru_RU-ruslan-medium)
+
+- 💬 **Intelligent Chat Integration** • **Умная интеграция с чатом**
+    - Twitch chat bot with smart triggers | Twitch чат-бот с умными триггерами
+    - Context-aware responses based on chat history | Контекстные ответы на основе истории чата
+    - Highlighted message prioritization | Приоритизация выделенных сообщений
+
+- 🧠 **Advanced Memory System (RAG)** • **Продвинутая система памяти (RAG)**
+    - FAISS vector indexing with Sentence Transformers | FAISS векторная индексация с Sentence Transformers
+    - Intelligent fact extraction from conversations | Умное извлечение фактов из разговоров
+    - Semantic deduplication and memory consolidation | Семантическая дедупликация и консолидация памяти
+    - Context-aware retrieval with smart filtering | Контекстный поиск с умной фильтрацией
+    - Automatic categorization (personal_info, preferences, events) | Автоматическая категоризация (личная_инфо,
+      предпочтения, события)
+
+- 📸 **Visual Context Analysis** • **Анализ визуального контекста**
+    - Screenshot capture with intent detection | Захват скриншотов с определением намерений
+    - Multi-monitor support with target resolution scaling | Поддержка нескольких мониторов с масштабированием
+      разрешения
+    - Visual reference understanding for enhanced responses | Понимание визуальных ссылок для улучшенных ответов
+
+- ⚡ **Smart Automation** • **Умная автоматизация**
+    - Idle monologues during silence periods | Монологи в периоды тишины
+    - Hotkey controls for real-time management | Управление горячими клавишами в реальном времени
+    - Automatic activity detection and response prioritization | Автоматическое определение активности и приоритизация
+      ответов
+
+- 🔧 **Advanced Configuration** • **Расширенные настройки**
+    - CUDNN optimization for GPU acceleration | CUDNN оптимизация для ускорения GPU
+    - Configurable audio devices and parameters | Настраиваемые аудио устройства и параметры
+    - Customizable VAD thresholds and timing | Настраиваемые пороги VAD и тайминги
+    - Multiple model configurations | Конфигурации нескольких моделей
 
 ---
 
@@ -43,10 +73,11 @@ LLM, faster-whisper medium с compute type int8 для STT). Голос можн
 
 ### Requirements | Требования
 
-- Python 3.10+
-- `piper.exe` + .onnx voice models (download separately)
-- LLM API: Together AI
-- NVidia CUDNN v9.8 & CUDA v12.8
+- Python 3.10+ | Python 3.10+
+- **NVIDIA GPU with CUDA 12.8 + CUDNN v9.8 (REQUIRED)** | **NVIDIA GPU с CUDA 12.8 + CUDNN v9.8 (ОБЯЗАТЕЛЬНО)**
+    - Download CUDNN: https://developer.nvidia.com/cudnn | Скачать CUDNN: https://developer.nvidia.com/cudnn
+- `piper.exe` + .onnx voice models | `piper.exe` + .onnx модели голосов
+- Together AI API access | Доступ к Together AI API
 
 ### Installation | Установка
 
@@ -56,57 +87,185 @@ cd George-Droid
 pip install -r requirements.txt
 ```
 
-Create a `.env` file:
+### Environment Configuration | Настройка окружения
+
+Create a `.env` file with the following variables: | Создайте файл `.env` со следующими переменными:
 
 ```env
-TWITCH_ACCESS_TOKEN=...
-TWITCH_BOT_NICK=*your_twitch_nick*
-TWITCH_CHANNEL=*your_twitch_nick*
-TWITCH_REFRESH_TOKEN=...
-TWITCH_CLIENT_ID=...
-TWITCH_CLIENT_SECRET=...
-TOGETHERAI_API_KEY=*your-togetherai-api-key*
-TOGETHERAI_MODEL_NAME=*model-id-or-name*
-``` 
+# Twitch Configuration | Конфигурация Twitch
+TWITCH_ACCESS_TOKEN=your_twitch_oauth_token
+TWITCH_BOT_NICK=your_twitch_bot_nick
+TWITCH_CHANNEL=your_twitch_channel
+TWITCH_REFRESH_TOKEN=your_refresh_token
+TWITCH_CLIENT_ID=your_client_id
+TWITCH_CLIENT_SECRET=your_client_secret
 
-Make sure you’ve downloaded:
+# Together AI Configuration | Конфигурация Together AI
+TOGETHER_API_KEY=your_together_ai_api_key
+TOGETHER_MODEL_ID=meta-llama/Llama-4-Scout-17B-16E-Instruct
 
-- Voice model `.onnx` → `voices/`
+# TTS Configuration (Piper) | Конфигурация TTS (Piper)
+PIPER_EXE_PATH=piper_tts_bin/piper.exe
+PIPER_VOICE_MODEL_PATH=voices/ru_RU-ruslan-medium.onnx
+PIPER_VOICE_CONFIG_PATH=voices/ru_RU-ruslan-medium.onnx.json
+
+# CUDA/CUDNN Configuration (Optional) | Конфигурация CUDA/CUDNN (Опционально)
+CUDNN_PATH=C:\Program Files\NVIDIA\CUDNN\v9.8\bin\12.8
+```
+
+### Download Required Files | Скачайте необходимые файлы
+
+1. **Piper TTS Binary**: Download `piper.exe` and place in `piper_tts_bin/` | **Piper TTS Бинарный файл**: Скачайте
+   `piper.exe` и поместите в `piper_tts_bin/`
+2. **Voice Models**: Download `.onnx` and `.onnx.json` voice files and place in `voices/` | **Модели голосов**: Скачайте
+   файлы `.onnx` и `.onnx.json` голосов и поместите в `voices/`
 
 ---
 
 ## 🎛️ Customization | Настройка
 
-- Change the **system prompt** and **bot name** in `main.py` (search for `SYSTEM_PROMPT`)
-- Use hotkeys:
-    - `Ctrl+;` → toggle speech recognition (STT)
-    - `Ctrl+'` → toggle Twitch chat reaction
-- You can add your own `.onnx` voice models in `voices/`
+### Bot Personality | Личность бота
+
+- Edit `SYSTEM_PROMPT` in `main.py` to change the bot's personality | Отредактируйте `SYSTEM_PROMPT` в `main.py` для
+  изменения личности бота
+- Modify `BOT_NAME_FOR_CHECK` to change trigger name in chat | Измените `BOT_NAME_FOR_CHECK` для изменения триггерного
+  имени в чате
+
+### Voice Configuration | Настройка голоса
+
+- Add custom `.onnx` voice models to `voices/` directory | Добавьте пользовательские `.onnx` модели голосов в папку
+  `voices/`
+- Update `PIPER_VOICE_MODEL_PATH` and `PIPER_VOICE_CONFIG_PATH` in `.env` | Обновите `PIPER_VOICE_MODEL_PATH` и
+  `PIPER_VOICE_CONFIG_PATH` в `.env`
+
+### Model Configuration | Настройка моделей
+
+- Change `TOGETHER_MODEL_ID` for different response quality/speed | Измените `TOGETHER_MODEL_ID` для изменения
+  качества/скорости ответов
+- Modify `INTENT_ANALYSIS_MODEL_ID` and `CHUNKING_MODEL_ID` for specialized tasks | Измените `INTENT_ANALYSIS_MODEL_ID`
+  и `CHUNKING_MODEL_ID` для специализированных задач
+
+### Hotkey Controls | Управление горячими клавишами
+
+- `Ctrl+;` → Toggle speech recognition (STT) | `Ctrl+;` → Переключить распознавание речи (STT)
+- `Ctrl+'` → Toggle Twitch chat interaction | `Ctrl+'` → Переключить взаимодействие с чатом Twitch
+
+### Audio Configuration | Настройка аудио
+
+- The bot will prompt you to select audio output device on startup | Бот предложит выбрать устройство вывода аудио при
+  запуске
+- Monitor selection for screenshots is also configurable on startup | Выбор монитора для скриншотов также настраивается
+  при запуске
 
 ---
 
-## 📁 Project Structure | Структура
+## 📁 Project Structure | Структура проекта
 
 ```
 George-Droid/
-├── main.py                    # Main assistant logic
-├── requirements.txt
-├── .env
-├── piper_tts_bin/             # Piper TTS binary
-├── voices/                    # .onnx voice models
-├── data_george_memory         # memory folder
-└── obs_ai_response.txt        # Output text for OBS overlays
+├── main.py                     # Main application logic | Основная логика приложения
+├── backend/
+│   └── memory_store.py        # RAG memory system implementation | Реализация системы памяти RAG
+├── requirements.txt           # Python dependencies | Зависимости Python
+├── .env                       # Environment configuration | Конфигурация окружения
+├── piper_tts_bin/            # Piper TTS binary | Бинарный файл Piper TTS
+├── voices/                   # Voice model files (.onnx) | Файлы моделей голосов (.onnx)
+├── data_george_memory/       # Persistent memory storage | Постоянное хранение памяти
+│   ├── george_memory.index   # FAISS vector index | FAISS векторный индекс
+│   └── george_memory_meta.jsonl # Memory metadata | Метаданные памяти
+├── screenshots_temp/         # Temporary screenshot storage | Временное хранение скриншотов
+└── obs_ai_response.txt       # Output for OBS text overlays | Вывод для текстовых оверлеев OBS
 ```
+
+---
+
+## 🧠 Memory System Details | Детали системы памяти
+
+### Fact Extraction | Извлечение фактов
+
+- Automatic extraction of personal info, preferences, and events | Автоматическое извлечение личной информации,
+  предпочтений и событий
+- Smart categorization with confidence scoring | Умная категоризация с оценкой уверенности
+- Entity recognition (dates, names, games, etc.) | Распознавание сущностей (даты, имена, игры и т.д.)
+- Duplicate prevention with semantic similarity checking | Предотвращение дубликатов с проверкой семантического сходства
+
+### Memory Categories | Категории памяти
+
+- `personal_info` - Personal facts about users | `personal_info` - Личные факты о пользователях
+- `preference` - User preferences and likes/dislikes | `preference` - Предпочтения пользователей и симпатии/антипатии
+- `event` - Important events and milestones | `event` - Важные события и вехи
+- `statement` - General statements and observations | `statement` - Общие утверждения и наблюдения
+- `bot_response` - Bot's own responses for consistency | `bot_response` - Собственные ответы бота для консистентности
+
+### Retrieval System | Система поиска
+
+- Context-aware query processing | Контекстная обработка запросов
+- Smart filtering by relevance and recency | Умная фильтрация по релевантности и свежести
+- Multi-factor scoring (similarity, author, type) | Многофакторная оценка (сходство, автор, тип)
+- Automatic consolidation of related memories | Автоматическая консолидация связанных воспоминаний
+
+---
+
+## 🔧 Performance Optimization | Оптимизация производительности
+
+### GPU Acceleration | Ускорение на GPU
+
+- CUDA support for Faster-Whisper STT | Поддержка CUDA для Faster-Whisper STT
+- CUDNN optimization for neural networks | CUDNN оптимизация для нейронных сетей
+- Configurable compute types (int8, float16, float32) | Настраиваемые типы вычислений (int8, float16, float32)
+
+### Memory Management | Управление памятью
+
+- Efficient FAISS indexing with embedding dimension validation | Эффективная FAISS индексация с валидацией размерности
+  эмбеддингов
+- Automatic index rebuilding on dimension mismatches | Автоматическое пересоздание индекса при несоответствии
+  размерностей
+- Lazy loading and caching for optimal performance | Ленивая загрузка и кэширование для оптимальной производительности
+
+### Audio Processing | Обработка аудио
+
+- Configurable VAD thresholds for noise environments | Настраиваемые пороги VAD для шумных сред
+- Real-time resampling and channel conversion | Пересэмплинг и конвертация каналов в реальном времени
+- Async processing to prevent blocking | Асинхронная обработка для предотвращения блокировок
 
 ---
 
 ## 🧠 Tech Stack | Технологии
 
-- LLM API: Together AI
-- STT: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-- TTS: [Piper TTS](https://github.com/rhasspy/piper)
-- Chat: [twitchio](https://github.com/TwitchIO/TwitchIO)
-- Memory: [FAISS](https://faiss.ai/), [Sentence-Transformers](https://www.sbert.net/)
+- **LLM API**: [Together AI](https://www.together.ai/) with Meta Llama models
+- **STT**: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with CUDA acceleration
+- **TTS**: [Piper TTS](https://github.com/rhasspy/piper) for natural speech synthesis
+- **Chat**: [twitchio](https://github.com/TwitchIO/TwitchIO) for Twitch integration
+- **Memory**: [FAISS](https://faiss.ai/) + [Sentence-Transformers](https://www.sbert.net/) for RAG
+- **Vision**: [PIL](https://pillow.readthedocs.io/) + [mss](https://python-mss.readthedocs.io/) for screenshots
+- **Audio**: [sounddevice](https://python-sounddevice.readthedocs.io/) + [scipy](https://scipy.org/) for processing
+
+---
+
+## 🚀 Advanced Usage | Расширенное использование
+
+### Custom Model Integration | Интеграция пользовательских моделей
+
+You can easily switch between different Together AI models by modifying the model IDs in `main.py`: | Вы можете легко
+переключаться между различными моделями Together AI, изменив ID моделей в `main.py`:
+
+```python
+TOGETHER_MODEL_ID = "meta-llama/Llama-3.1-70B-Instruct-Turbo"  # Main responses | Основные ответы
+INTENT_ANALYSIS_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct-Turbo"  # Intent analysis | Анализ намерений
+CHUNKING_MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"  # Text processing | Обработка текста
+```
+
+### Memory System Tuning | Настройка системы памяти
+
+Adjust memory parameters for different use cases: | Настройте параметры памяти для различных случаев использования:
+
+```python
+# In memory_store.py | В memory_store.py
+VAD_ENERGY_THRESHOLD = 0.005        # Voice activity sensitivity | Чувствительность голосовой активности
+VAD_SILENCE_TIMEOUT_MS = 1200       # Silence detection timeout | Таймаут детекции тишины
+MAX_HISTORY_LENGTH = 10             # Conversation history size | Размер истории разговора
+semantic_similarity_threshold = 0.97 # Duplicate detection sensitivity | Чувствительность детекции дубликатов
+```
 
 ---
 
@@ -118,6 +277,21 @@ MIT License
 
 ## ✨ Credits
 
-- Neuro-Sama by Vedal987 — the inspiration behind it all
-- Piper by Rhasspy
+- **Inspiration**: Neuro-Sama by Vedal987 — the inspiration behind it all
+- **TTS**: Piper by Rhasspy team
+- **Models**: Meta AI for Llama model family
+- **Platform**: Together AI for model hosting
 - Made with ❤️ by [FIREX (Stepan)](https://firexrwt.github.io)
+
+---
+
+## 📞 Support | Поддержка
+
+For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/firexrwt/George-Droid)
+or contact the maintainer at stepanveremeev@gmail.com | По вопросам, проблемам или предложениям
+посетите [GitHub репозиторий](https://github.com/firexrwt/George-Droid) или свяжитесь с разработчиком по адресу
+stepanveremeev@gmail.com
+
+---
+
+*Built for streamers, by a streamer. Happy streaming! 🎮* | *Сделано стримером для стримеров. Удачных стримов! 🎮*
