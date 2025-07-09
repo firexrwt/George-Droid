@@ -164,17 +164,48 @@ CUDNN_PATH=C:\Program Files\NVIDIA\CUDNN\v9.8\bin\12.8
 ```
 George-Droid/
 ├── main.py                     # Main application logic | Основная логика приложения
-├── backend/
-│   └── memory_store.py        # RAG memory system implementation | Реализация системы памяти RAG
 ├── requirements.txt           # Python dependencies | Зависимости Python
 ├── .env                       # Environment configuration | Конфигурация окружения
-├── piper_tts_bin/            # Piper TTS binary | Бинарный файл Piper TTS
+├── .gitignore                 # Git ignore rules | Правила игнорирования Git
+├── .gitattributes             # Git attributes | Атрибуты Git
+├── obs_ai_response.txt       # Output for OBS text overlays | Вывод для текстовых оверлеев OBS
+├── ai/                       # AI and LLM modules | ИИ и LLM модули
+│   ├── __init__.py
+│   ├── llm_client.py         # Together AI client implementation | Реализация клиента Together AI
+│   └── memory_handler.py     # Memory processing and fact extraction | Обработка памяти и извлечение фактов
+├── audio/                    # Audio processing modules | Модули обработки аудио
+│   ├── __init__.py
+│   ├── audio_processor.py    # STT, TTS, and audio processing | STT, TTS и обработка аудио
+│   ├── device_manager.py     # Audio device selection | Выбор аудио устройств
+│   └── vad.py               # Voice Activity Detection | Детекция голосовой активности
+├── backend/                  # Backend systems | Бэкенд системы
+│   └── memory_store.py      # RAG memory system implementation | Реализация системы памяти RAG
+├── config/                   # Configuration modules | Модули конфигурации
+│   ├── __init__.py
+│   └── settings.py          # Application settings and environment variables | Настройки приложения и переменные окружения
+├── core/                     # Core processing modules | Основные модули обработки
+│   ├── __init__.py
+│   ├── processor.py         # Main processing logic and STT loop | Основная логика обработки и цикл STT
+│   └── monologue.py         # Idle monologue generation | Генерация монологов в тишине
+├── twitch/                   # Twitch integration | Интеграция с Twitch
+│   ├── __init__.py
+│   └── bot.py               # Twitch chat bot implementation | Реализация чат-бота Twitch
+├── utils/                    # Utility modules | Утилиты
+│   ├── __init__.py
+│   ├── hotkeys.py           # Hotkey management | Управление горячими клавишами
+│   └── diagnostics.py       # System diagnostics and monitoring | Диагностика и мониторинг системы
+├── vision/                   # Visual processing modules | Модули обработки изображений
+│   ├── __init__.py
+│   └── screenshot_handler.py # Screenshot capture and processing | Захват и обработка скриншотов
+├── piper_tts_bin/           # Piper TTS binary | Бинарный файл Piper TTS
+│   └── piper.exe            # TTS executable | Исполняемый файл TTS
 ├── voices/                   # Voice model files (.onnx) | Файлы моделей голосов (.onnx)
+│   ├── ru_RU-ruslan-medium.onnx      # Russian voice model | Русская модель голоса
+│   └── ru_RU-ruslan-medium.onnx.json # Voice model config | Конфигурация модели голоса
 ├── data_george_memory/       # Persistent memory storage | Постоянное хранение памяти
 │   ├── george_memory.index   # FAISS vector index | FAISS векторный индекс
 │   └── george_memory_meta.jsonl # Memory metadata | Метаданные памяти
-├── screenshots_temp/         # Temporary screenshot storage | Временное хранение скриншотов
-└── obs_ai_response.txt       # Output for OBS text overlays | Вывод для текстовых оверлеев OBS
+└── screenshots_temp/         # Temporary screenshot storage | Временное хранение скриншотов
 ```
 
 ---
